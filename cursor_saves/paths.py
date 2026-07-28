@@ -107,6 +107,30 @@ def _decode_file_uri(uri: str) -> str:
     return path
 
 
+def _parse_remote_uri(uri: str) -> tuple[Optional[str], str]:
+    """Parse a vscode-remote:// URI into (host, filesystem_path).
+
+    Format: vscode-remote://ssh-remote%2B<host>/<path>
+            vscode-remote://wsl%2Bubuntu-24.04/<path>
+    Returns (host, "") if the URI has no path portion.
+    """
+    host = None
+    # Format: vscode-remote://ssh-remote%2B<host>/<path>
+    authority = uri.split("/")[2]  # ssh-remote%2B<host> or wsl%2Bubuntu-...
+    if "%2B" in authority:
+        host = authority.split("%2B", 1)[1]
+    elif "+" in authority:
+        host = authority.split("+", 1)[1]
+    # Decode the host if it's hex-encoded JSON (e.g. {"hostName":"core"})
+    if host:
+        host = unquote(host)
+        host = _decode_ssh_host(host)
+    parts = uri.split("/", 3)
+    if len(parts) >= 4:
+        return host, "/" + parts[3]
+    return host, ""
+
+
 def find_workspace_dirs_for_project(project_path: str) -> list[Path]:
     """Find all workspace directories that map to a given project path.
 
@@ -212,10 +236,17 @@ def list_all_workspaces() -> list[dict]:
             # workspace .code-workspace: uses "workspace" key instead of "folder"
             if "workspace" in data and not data.get("folder"):
                 ws_uri = data["workspace"]
+                folder_uri = ws_uri
+                ws_type = "workspace"
                 if ws_uri.startswith("file://"):
-                    folder_uri = ws_uri
                     folder_path = _decode_file_uri(ws_uri)
-                    ws_type = "workspace"
+                elif ws_uri.startswith("vscode-remote://"):
+                    # Remote multi-root (.code-workspace via WSL/SSH), same
+                    # authority/path parse as folder remotes — otherwise these
+                    # workspaces are skipped and their chats look orphaned.
+                    host, folder_path = _parse_remote_uri(ws_uri)
+                    if not folder_path:
+                        continue
                 else:
                     continue
             else:
@@ -227,20 +258,8 @@ def list_all_workspaces() -> list[dict]:
                     folder_path = _decode_file_uri(folder_uri)
                 elif folder_uri.startswith("vscode-remote://"):
                     ws_type = "ssh"
-                    # Format: vscode-remote://ssh-remote%2B<host>/<path>
-                    authority = folder_uri.split("/")[2]  # ssh-remote%2B<host>
-                    if "%2B" in authority:
-                        host = authority.split("%2B", 1)[1]
-                    elif "+" in authority:
-                        host = authority.split("+", 1)[1]
-                    # Decode the host if it's hex-encoded JSON (e.g. {"hostName":"core"})
-                    if host:
-                        host = unquote(host)
-                        host = _decode_ssh_host(host)
-                    parts = folder_uri.split("/", 3)
-                    if len(parts) >= 4:
-                        folder_path = "/" + parts[3]
-                    else:
+                    host, folder_path = _parse_remote_uri(folder_uri)
+                    if not folder_path:
                         continue
                 else:
                     continue
@@ -539,12 +558,15 @@ def format_workspace_display(ws: dict, include_path: bool = True) -> str:
             return f"ssh {host} {path}"
         return f"ssh {host}"
     elif ws["type"] == "workspace":
+        host = ws.get("host")
         if include_path:
             path = ws["path"]
             if len(path) > 45:
                 path = "..." + path[-42:]
+            if host:
+                return f"(workspace) {host} {path}"
             return f"(workspace) {path}"
-        return "(workspace)"
+        return f"(workspace) {host}" if host else "(workspace)"
     else:
         if include_path:
             path = ws["path"]
