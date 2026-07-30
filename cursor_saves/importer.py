@@ -722,23 +722,26 @@ def find_snapshot_dir_for_project(
         return exact
 
     # 2. Basename match (covers SSH workspace push → local pull)
-    basename = os.path.basename(os.path.normpath(target_project_path))
+    target_canon = paths.canonicalize_project_path(target_project_path)
+    basename = os.path.basename(target_canon or os.path.normpath(target_project_path))
     basename_dir = snapshots_dir / basename
     if basename_dir.exists() and basename_dir != exact and list_snapshot_files(basename_dir):
         return basename_dir
 
-    # 3. Scan snapshot dirs for matching source path basenames
-    # This handles the case where the project was pushed from a different
-    # machine with a different directory structure but same repo
+    # 3. Scan snapshot dirs for matching source path (canonical or basename)
     for project_dir in snapshots_dir.iterdir():
         if not project_dir.is_dir() or project_dir == exact or project_dir == basename_dir:
             continue
-        # Check first snapshot file for a matching source path basename
         for sf in list_snapshot_files(project_dir):
             try:
                 data = read_snapshot_file(sf)
                 source_path = data.get("sourceProjectPath", "")
-                if source_path and os.path.basename(os.path.normpath(source_path)) == basename:
+                if not source_path:
+                    break
+                source_canon = paths.canonicalize_project_path(source_path)
+                if target_canon and source_canon and target_canon == source_canon:
+                    return project_dir
+                if os.path.basename(source_canon or os.path.normpath(source_path)) == basename:
                     return project_dir
             except (json.JSONDecodeError, OSError, gzip.BadGzipFile):
                 pass
@@ -1507,10 +1510,15 @@ def doctor_audit() -> dict:
     # --- Build workspace-by-path map for orphan matching ---
     ws_by_path: dict[str, list[dict]] = {}
     for ws in all_ws:
-        p = ws["path"]
-        if p not in ws_by_path:
-            ws_by_path[p] = []
-        ws_by_path[p].append(ws)
+        keys = {
+            ws["path"],
+            ws.get("canonical_path")
+            or paths.canonicalize_project_path(ws.get("folder_uri") or ws["path"]),
+        }
+        for p in keys:
+            if not p:
+                continue
+            ws_by_path.setdefault(p, []).append(ws)
 
     # --- Scan global DB ---
     orphaned = []
@@ -1592,10 +1600,15 @@ def doctor_recover(
     # Build map: workspace path -> best workspace dir (newest first, already sorted)
     ws_by_path: dict[str, list[dict]] = {}
     for ws in all_ws:
-        p = ws["path"]
-        if p not in ws_by_path:
-            ws_by_path[p] = []
-        ws_by_path[p].append(ws)
+        keys = {
+            ws["path"],
+            ws.get("canonical_path")
+            or paths.canonicalize_project_path(ws.get("folder_uri") or ws["path"]),
+        }
+        for p in keys:
+            if not p:
+                continue
+            ws_by_path.setdefault(p, []).append(ws)
 
     # Get the audit to find orphaned chats
     audit = doctor_audit()
@@ -1668,13 +1681,15 @@ def _find_best_workspace(
 
     if file_paths_seen:
         best_path = max(file_paths_seen, key=file_paths_seen.get)
-        return ws_by_path[best_path][0]
+        candidates = ws_by_path[best_path]
+        return sorted(candidates, key=paths._workspace_match_rank)[0]
 
     # Strategy 2: check composerData for path references
     cd_str = json.dumps(composer_data)
     for ws_path in ws_by_path:
         if ws_path in cd_str and len(ws_path) > 5:
-            return ws_by_path[ws_path][0]
+            candidates = ws_by_path[ws_path]
+            return sorted(candidates, key=paths._workspace_match_rank)[0]
 
     # Strategy 3: check workspace DBs for ghost selectedComposerIds
     for ws_path, ws_list in ws_by_path.items():

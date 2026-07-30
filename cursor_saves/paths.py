@@ -131,6 +131,80 @@ def _parse_remote_uri(uri: str) -> tuple[Optional[str], str]:
     return host, ""
 
 
+def canonicalize_project_path(path: str) -> str:
+    """Stable path key for matching the same repo across Cursor URI views.
+
+    Examples (not machine-specific — any distro/host name):
+      vscode-remote://wsl+Ubuntu-24.04/home/u/proj
+          -> /home/u/proj
+      file://wsl.localhost/Ubuntu-24.04/home/u/proj
+          -> /home/u/proj
+      file:////wsl.localhost/Ubuntu-24.04/home/u/proj
+          -> /home/u/proj
+      \\\\wsl$\\\\Ubuntu-24.04\\\\home\\\\u\\\\proj
+          -> /home/u/proj
+      \\home\\u\\proj  (Windows normpath of a remote path)
+          -> /home/u/proj
+      C:\\Users\\u\\proj
+          -> c:/Users/u/proj  (Windows local; drive letter lowercased)
+
+    Does not rewrite unrelated Windows paths into WSL form.
+    """
+    if not path:
+        return ""
+
+    raw = path.strip()
+    if raw.startswith("file://"):
+        raw = _decode_file_uri(raw)
+    elif raw.startswith("vscode-remote://"):
+        _host, remote_path = _parse_remote_uri(raw)
+        raw = remote_path or raw
+
+    # Unify separators; collapse duplicate slashes
+    s = raw.replace("\\", "/")
+    while "//" in s:
+        s = s.replace("//", "/")
+
+    # \\wsl.localhost\Distro\... or \\wsl$\Distro\... (and slash variants)
+    m = re.match(
+        r"^/*wsl(?:\.localhost|\$)/+([^/]+)/+(.*)$",
+        s,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        rest = m.group(2)
+        if not rest.startswith("/"):
+            rest = "/" + rest
+        return (rest.rstrip("/") or "/")
+
+    # Remote-style / POSIX path (including Windows-normalized "\home\...")
+    if s.startswith("/") and not (len(s) > 2 and s[1].isalpha() and s[2] == ":"):
+        return s.rstrip("/") or "/"
+
+    # Local Windows drive path
+    if platform.system() == "Windows":
+        norm = os.path.normpath(raw).replace("\\", "/")
+        if len(norm) >= 2 and norm[1] == ":":
+            return (norm[0].lower() + norm[1:]).rstrip("/") or norm
+        return norm.rstrip("/") or "/"
+
+    return os.path.normpath(raw).replace("\\", "/").rstrip("/") or "/"
+
+
+def _workspace_match_rank(ws: dict) -> tuple:
+    """Sort key: prefer vscode-remote over wsl.localhost file://, then newer."""
+    uri = (ws.get("folder_uri") or "").lower()
+    if uri.startswith("vscode-remote://"):
+        view_rank = 0
+    elif "wsl.localhost" in uri or "wsl$" in uri:
+        view_rank = 2
+    else:
+        view_rank = 1
+    # Prefer ordinary folders over multi-root .code-workspace files
+    type_rank = 1 if ws.get("type") == "workspace" else 0
+    return (view_rank, type_rank, -float(ws.get("mtime") or 0))
+
+
 def find_workspace_dirs_for_project(project_path: str) -> list[Path]:
     """Find all workspace directories that map to a given project path.
 
@@ -141,11 +215,13 @@ def find_workspace_dirs_for_project(project_path: str) -> list[Path]:
     if not ws_storage.exists():
         return []
 
-    # Normalise the target path for comparison
-    target = os.path.normpath(os.path.expanduser(project_path))
-    # On Windows, paths are case-insensitive
+    target = canonicalize_project_path(project_path)
     if platform.system() == "Windows":
-        target = target.lower()
+        # Drive-letter paths are lowercased by canonicalize; remote POSIX paths
+        # keep case. Also accept case-insensitive compare for local-only targets.
+        target_cmp = target
+    else:
+        target_cmp = target
 
     matches = []
     for ws_dir in ws_storage.iterdir():
@@ -156,25 +232,17 @@ def find_workspace_dirs_for_project(project_path: str) -> list[Path]:
             continue
         try:
             data = json.loads(ws_json.read_text())
-            folder_uri = data.get("folder", "")
-            # Handle file:// URIs
-            if folder_uri.startswith("file://"):
-                folder_path = _decode_file_uri(folder_uri)
-            elif folder_uri.startswith("vscode-remote://"):
-                # SSH remote workspace - extract the path portion
-                # Format: vscode-remote://ssh-remote%2B<host>/<path>
-                parts = folder_uri.split("/", 3)
-                if len(parts) >= 4:
-                    folder_path = "/" + parts[3]
-                else:
-                    continue
-            else:
+            folder_uri = data.get("folder") or data.get("workspace") or ""
+            if not folder_uri:
+                continue
+            if not (
+                folder_uri.startswith("file://")
+                or folder_uri.startswith("vscode-remote://")
+            ):
                 continue
 
-            norm_folder = os.path.normpath(folder_path)
-            if platform.system() == "Windows":
-                norm_folder = norm_folder.lower()
-            if norm_folder == target:
+            folder_canon = canonicalize_project_path(folder_uri)
+            if folder_canon == target_cmp:
                 matches.append(ws_dir)
         except (json.JSONDecodeError, OSError):
             continue
@@ -271,6 +339,7 @@ def list_all_workspaces() -> list[dict]:
             workspaces.append({
                 "folder_uri": folder_uri,
                 "path": os.path.normpath(folder_path),
+                "canonical_path": canonicalize_project_path(folder_uri or folder_path),
                 "type": ws_type,
                 "host": host,
                 "workspace_dir": ws_dir,
@@ -517,30 +586,66 @@ def find_all_matching_workspaces(source_path: str) -> list[dict]:
     """Find all workspaces that could receive imports from source_path.
 
     Matches by:
-    1. Exact path match (for SSH workspaces with same remote path)
+    1. Canonical path equality (WSL remote / wsl.localhost / UNC / POSIX)
     2. Same basename (fallback for different directory structures)
 
-    Returns list of workspace dicts with type, host, path, workspace_dir,
-    sorted by match quality (exact matches first) then by mtime.
+    Within each tier, prefers vscode-remote:// targets over file://wsl.localhost,
+    then ordinary folders over .code-workspace, then newer mtime.
+
+    Returns list of workspace dicts with type, host, path, workspace_dir.
     """
     all_ws = list_all_workspaces()
-    source_normalized = os.path.normpath(source_path)
-    source_basename = os.path.basename(source_normalized)
+    source_canon = canonicalize_project_path(source_path)
+    source_basename = os.path.basename(
+        source_canon or os.path.normpath(source_path)
+    )
 
-    exact_matches = []
-    basename_matches = []
+    exact_matches: list[dict] = []
+    basename_matches: list[dict] = []
+    seen: set[str] = set()
 
     for ws in all_ws:
-        ws_path = ws["path"]
-        ws_basename = os.path.basename(ws_path)
+        ws_dir_key = str(ws["workspace_dir"])
+        ws_canon = ws.get("canonical_path") or canonicalize_project_path(
+            ws.get("folder_uri") or ws["path"]
+        )
+        ws_basename = os.path.basename(ws_canon or ws["path"])
 
-        if ws_path == source_normalized:
-            exact_matches.append(ws)
-        elif ws_basename == source_basename:
-            basename_matches.append(ws)
+        if source_canon and ws_canon and source_canon == ws_canon:
+            if ws_dir_key not in seen:
+                exact_matches.append(ws)
+                seen.add(ws_dir_key)
+        elif source_basename and ws_basename == source_basename:
+            if ws_dir_key not in seen:
+                basename_matches.append(ws)
+                seen.add(ws_dir_key)
 
-    # Return exact matches first, then basename matches
-    return exact_matches + basename_matches
+    exact_matches.sort(key=_workspace_match_rank)
+    basename_matches.sort(key=_workspace_match_rank)
+
+    # Same repo under WSL remote + wsl.localhost + UNC shares one canonical
+    # path — keep the best-ranked view so pull doesn't prompt on equivalents.
+    return _collapse_equivalent_workspaces(exact_matches + basename_matches)
+
+
+def _collapse_equivalent_workspaces(workspaces: list[dict]) -> list[dict]:
+    """Dedupe workspaces that canonicalize to the same project path."""
+    best: dict[str, dict] = {}
+    order: list[str] = []
+    passthrough: list[dict] = []
+    for ws in workspaces:
+        key = ws.get("canonical_path") or canonicalize_project_path(
+            ws.get("folder_uri") or ws["path"]
+        )
+        if not key:
+            passthrough.append(ws)
+            continue
+        if key not in best:
+            best[key] = ws
+            order.append(key)
+        elif _workspace_match_rank(ws) < _workspace_match_rank(best[key]):
+            best[key] = ws
+    return [best[k] for k in order] + passthrough
 
 
 def format_workspace_display(ws: dict, include_path: bool = True) -> str:
