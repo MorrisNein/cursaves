@@ -243,6 +243,54 @@ class CursorDB:
         except sqlite3.OperationalError:
             return {}
 
+    def list_native_composer_headers(self) -> list[dict]:
+        """Read Cursor 3.x native ``composerHeaders`` SQL table as header dicts.
+
+        Each row's ``value`` JSON is returned, with ``workspaceIdentifier.id``
+        taken from the ``workspaceId`` column (sidebar index key). Returns []
+        if the table is absent (older Cursor builds).
+        """
+        conn = self._ensure_read_copy()
+        try:
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='composerHeaders'"
+            ).fetchone()
+            if not exists:
+                return []
+            rows = conn.execute(
+                "SELECT composerId, workspaceId, value FROM composerHeaders"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+
+        out: list[dict] = []
+        for cid, workspace_id, value in rows:
+            entry: Optional[dict] = None
+            if value is not None:
+                try:
+                    if isinstance(value, bytes):
+                        value = value.decode("utf-8", errors="replace")
+                    parsed = json.loads(value)
+                    if isinstance(parsed, dict):
+                        entry = parsed
+                except (json.JSONDecodeError, TypeError):
+                    entry = None
+            if entry is None:
+                entry = {}
+            if cid and not entry.get("composerId"):
+                entry["composerId"] = cid
+            if workspace_id:
+                wi = entry.get("workspaceIdentifier")
+                if not isinstance(wi, dict):
+                    wi = {}
+                else:
+                    wi = dict(wi)
+                wi["id"] = workspace_id
+                entry["workspaceIdentifier"] = wi
+            if entry.get("composerId"):
+                out.append(entry)
+        return out
+
     def get_items_by_keys_binary(self, keys: list[str], table: str = "cursorDiskKV") -> dict[str, bytes]:
         """Get multiple raw binary values from the key-value store in a single query."""
         if not keys:

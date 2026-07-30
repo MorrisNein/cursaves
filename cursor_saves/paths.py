@@ -354,27 +354,47 @@ def list_all_workspaces() -> list[dict]:
 
 
 def get_global_composer_headers() -> list[dict]:
-    """Read the central composer.composerHeaders from the global DB.
+    """Return the global chat→workspace header index.
 
-    Returns the allComposers list from composer.composerHeaders in the
-    global DB's ItemTable. In Cursor 3.0+ this is the authoritative
-    index of all chats, each tagged with a workspaceIdentifier.
+    Merges two sources used by different Cursor generations:
 
-    Returns an empty list if not present (pre-3.0 Cursor).
+      1. Native SQL table ``composerHeaders`` (Cursor 3.x sidebar — current)
+      2. ItemTable JSON ``composer.composerHeaders`` / ``allComposers``
+         (3.0 migration index + cursaves dual-write)
+
+    When the same ``composerId`` exists in both, the SQL row wins. Entries
+    keep a ``workspaceIdentifier`` (id filled from the SQL ``workspaceId``
+    column when needed) so callers can group by workspace hash.
+
+    Returns an empty list if neither source is present.
     """
     from . import db
 
     global_db = get_global_db_path()
     if not global_db.exists():
         return []
+
+    by_id: dict[str, dict] = {}
     try:
         with db.CursorDB(global_db) as cdb:
+            # Legacy / dual-write JSON index first
             headers = cdb.get_json("composer.composerHeaders", table="ItemTable")
             if headers and isinstance(headers, dict):
-                return headers.get("allComposers", [])
+                for entry in headers.get("allComposers", []):
+                    if not isinstance(entry, dict):
+                        continue
+                    cid = entry.get("composerId")
+                    if cid:
+                        by_id[cid] = entry
+
+            # Native SQL index overlays (authoritative for current Cursor)
+            for entry in cdb.list_native_composer_headers():
+                cid = entry.get("composerId")
+                if cid:
+                    by_id[cid] = entry
     except Exception:
         pass
-    return []
+    return list(by_id.values())
 
 
 _global_headers_cache: Optional[dict[str, list[dict]]] = None
@@ -383,9 +403,8 @@ _global_headers_cache: Optional[dict[str, list[dict]]] = None
 def _build_global_headers_map() -> dict[str, list[dict]]:
     """Build a workspace-hash → [composer header entries] map from the global index.
 
-    Returns a dict keyed by workspace directory hash (workspaceIdentifier.id).
-    Each value is a list of composer header dicts for that workspace.
-    Cached for the lifetime of the process.
+    Uses ``get_global_composer_headers()`` (SQL ∪ JSON merge). Keyed by
+    ``workspaceIdentifier.id``. Cached for the lifetime of the process.
     """
     global _global_headers_cache
     if _global_headers_cache is not None:
@@ -394,6 +413,8 @@ def _build_global_headers_map() -> dict[str, list[dict]]:
     result: dict[str, list[dict]] = {}
     for entry in get_global_composer_headers():
         wi = entry.get("workspaceIdentifier", {})
+        if not isinstance(wi, dict):
+            continue
         ws_id = wi.get("id", "")
         if ws_id:
             result.setdefault(ws_id, []).append(entry)
@@ -411,8 +432,8 @@ def get_workspace_composer_ids(ws_db_path: Path) -> list[str]:
     """Extract all composer IDs associated with a workspace.
 
     Combines multiple sources for maximum coverage:
-    1. Global composer.composerHeaders index (Cursor 3.0+, most authoritative
-       but only contains recently-active chats)
+    1. Global header index — native SQL ``composerHeaders`` ∪ ItemTable JSON
+       (Cursor 3.x; SQL catches chats never written to the JSON blob)
     2. Workspace DB selectedComposerIds + composerChatViewPane entries
        (catches chats opened before the 3.0 migration that aren't yet
        in the global index)
