@@ -105,26 +105,41 @@ class GitBackend(SyncBackend):
 
     def __init__(self, sync_dir: Path):
         self.sync_dir = sync_dir
+        # Set by pull(): new origin tip, and changed composer IDs (None = full scan)
+        self.last_pull_tip: Optional[str] = None
+        self.last_changed_composer_ids: Optional[set[str]] = None
 
     # -- SyncBackend interface ------------------------------------------
 
-    def pull(self, snapshots_dir: Path) -> bool:
+    def pull(self, snapshots_dir: Path, previous_tip: Optional[str] = None) -> bool:
+        self.last_pull_tip = None
+        self.last_changed_composer_ids = None
         if not self.has_remote():
             return True
-        return self._reset_to_origin()
+        return self._reset_to_origin(previous_tip=previous_tip)
 
-    def push(self, snapshots_dir: Path) -> bool:
-        subprocess.run(
-            ["git", "add", "snapshots/"],
-            cwd=str(self.sync_dir), capture_output=True,
-        )
+    def push(
+        self,
+        snapshots_dir: Path,
+        paths: Optional[list[Path]] = None,
+    ) -> bool:
+        """Commit snapshot changes and push. If *paths* given, stage only those."""
+        if paths is not None:
+            if not paths:
+                return self._push_origin_only()
+            self._stage_snapshot_paths(paths)
+        else:
+            subprocess.run(
+                ["git", "add", "snapshots/"],
+                cwd=str(self.sync_dir), capture_output=True,
+            )
         result = subprocess.run(
             ["git", "diff", "--cached", "--quiet"],
             cwd=str(self.sync_dir), capture_output=True,
         )
         if result.returncode != 0:
-            from . import paths
-            hostname = paths.get_machine_id()
+            from . import paths as pathmod
+            hostname = pathmod.get_machine_id()
             msg = f"[{hostname}] sync snapshots"
             commit = subprocess.run(
                 ["git", "commit", "-m", msg],
@@ -139,23 +154,75 @@ class GitBackend(SyncBackend):
                 print(f"  Commit failed: {err}", file=sys.stderr)
                 return False
 
-        if self.has_remote():
+        return self._push_origin_only()
+
+    def _stage_snapshot_paths(self, paths: list[Path]) -> None:
+        sync_root = self.sync_dir.resolve()
+        staged: set[str] = set()
+
+        def _add(p: Path) -> None:
+            if not p.exists():
+                return
             try:
-                push_result = subprocess.run(
-                    ["git", "push", "-u", "origin", "main"],
-                    cwd=str(self.sync_dir),
-                    capture_output=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=1200,
-                )
-                if push_result.returncode != 0:
-                    print(f"  Push failed: {push_result.stderr.strip()}", file=sys.stderr)
-                    return False
-            except subprocess.TimeoutExpired:
-                print("  Push timed out", file=sys.stderr)
+                rel = str(p.resolve().relative_to(sync_root)).replace("\\", "/")
+            except ValueError:
+                return
+            if rel in staged:
+                return
+            staged.add(rel)
+            subprocess.run(
+                ["git", "add", "--", rel],
+                cwd=str(self.sync_dir), capture_output=True,
+            )
+
+        for p in paths:
+            _add(p)
+            name = p.name
+            if ".json.gz" in name:
+                stem = name.split(".json.gz", 1)[0]
+                _add(p.parent / f"{stem}.meta.json")
+                for shard in p.parent.glob(f"{stem}.json.gz.*"):
+                    if not shard.name.endswith(".meta.json"):
+                        _add(shard)
+
+    def _push_origin_only(self) -> bool:
+        """Push existing local commits to origin (no new commit)."""
+        if not self.has_remote():
+            return True
+        try:
+            push_result = subprocess.run(
+                ["git", "push", "-u", "origin", "main"],
+                cwd=str(self.sync_dir),
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=1200,
+            )
+            if push_result.returncode != 0:
+                print(f"  Push failed: {push_result.stderr.strip()}", file=sys.stderr)
                 return False
+        except subprocess.TimeoutExpired:
+            print("  Push timed out", file=sys.stderr)
+            return False
         return True
+
+    def has_unpushed_commits(self) -> bool:
+        if not self.has_remote():
+            return False
+        r = subprocess.run(
+            ["git", "rev-list", "--count", "origin/main..HEAD"],
+            cwd=str(self.sync_dir),
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        # Fail-safe: if we can't check, assume unpushed so reset is refused.
+        if r.returncode != 0:
+            return True
+        try:
+            return int((r.stdout or "0").strip() or "0") > 0
+        except ValueError:
+            return True
 
     def has_remote(self) -> bool:
         try:
@@ -175,9 +242,50 @@ class GitBackend(SyncBackend):
 
     # -- Git-specific helpers -------------------------------------------
 
-    def _reset_to_origin(self) -> bool:
+    def _worktree_dirty(self) -> bool:
+        r = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(self.sync_dir),
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        return bool((r.stdout or "").strip())
+
+    @staticmethod
+    def _composer_ids_from_diff_paths(paths: list[str]) -> set[str]:
+        ids: set[str] = set()
+        for raw in paths:
+            name = Path(raw.replace("\\", "/")).name
+            if name.endswith(".meta.json"):
+                cid = name[: -len(".meta.json")]
+            elif ".json.gz" in name:
+                cid = name.split(".json.gz", 1)[0]
+            else:
+                continue
+            if cid:
+                ids.add(cid)
+        return ids
+
+    def _reset_to_origin(self, previous_tip: Optional[str] = None) -> bool:
         """Fetch + hard-reset to origin/main.  Remote is ground truth."""
         if not self.sync_dir.exists():
+            return False
+
+        if self._worktree_dirty():
+            print(
+                "Error: ~/.cursaves has uncommitted changes. "
+                "Commit/push or clean them before pull "
+                "(refusing silent reset that would discard them).",
+                file=sys.stderr,
+            )
+            return False
+        if self.has_unpushed_commits():
+            print(
+                "Error: ~/.cursaves has unpushed commits. "
+                "Run 'cursaves push' (or git push in ~/.cursaves) before pull.",
+                file=sys.stderr,
+            )
             return False
 
         for abort_cmd in (
@@ -195,7 +303,6 @@ class GitBackend(SyncBackend):
             return True
 
         try:
-            # Check if remote is completely empty
             ls_remote = subprocess.run(
                 ["git", "ls-remote", "--heads", "origin"],
                 cwd=str(self.sync_dir),
@@ -205,11 +312,10 @@ class GitBackend(SyncBackend):
                 timeout=60,
             )
             if ls_remote.returncode == 0 and not ls_remote.stdout.strip():
-                # Remote is completely empty, nothing to fetch or reset to
                 return True
 
             fetch = subprocess.run(
-                ["git", "fetch", "--depth", "1", "origin"],
+                ["git", "fetch", "origin", "main"],
                 cwd=str(self.sync_dir),
                 capture_output=True,
                 encoding="utf-8",
@@ -217,8 +323,59 @@ class GitBackend(SyncBackend):
                 timeout=600,
             )
             if fetch.returncode != 0:
-                # Still failed?
-                return False
+                fetch = subprocess.run(
+                    ["git", "fetch", "--depth", "1", "origin"],
+                    cwd=str(self.sync_dir),
+                    capture_output=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=600,
+                )
+                if fetch.returncode != 0:
+                    return False
+
+            tip_r = subprocess.run(
+                ["git", "rev-parse", "origin/main"],
+                cwd=str(self.sync_dir),
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            new_tip = (tip_r.stdout or "").strip() if tip_r.returncode == 0 else ""
+
+            changed: Optional[set[str]] = None  # None = full scan
+            if previous_tip and new_tip and previous_tip != new_tip:
+                subprocess.run(
+                    ["git", "fetch", "--depth", "1", "origin", previous_tip],
+                    cwd=str(self.sync_dir),
+                    capture_output=True,
+                    timeout=120,
+                )
+                anc = subprocess.run(
+                    ["git", "merge-base", "--is-ancestor", previous_tip, "origin/main"],
+                    cwd=str(self.sync_dir),
+                    capture_output=True,
+                )
+                if anc.returncode == 0:
+                    diff = subprocess.run(
+                        [
+                            "git", "diff", "--name-only",
+                            previous_tip, "origin/main", "--", "snapshots/",
+                        ],
+                        cwd=str(self.sync_dir),
+                        capture_output=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    if diff.returncode == 0:
+                        paths = [
+                            ln.strip()
+                            for ln in (diff.stdout or "").splitlines()
+                            if ln.strip()
+                        ]
+                        changed = self._composer_ids_from_diff_paths(paths)
+            elif previous_tip and new_tip and previous_tip == new_tip:
+                changed = set()
 
             subprocess.run(
                 ["git", "checkout", "-f", "-B", "main", "origin/main"],
@@ -236,6 +393,8 @@ class GitBackend(SyncBackend):
                 ["git", "clean", "-fd"],
                 cwd=str(self.sync_dir), capture_output=True,
             )
+            self.last_pull_tip = new_tip or None
+            self.last_changed_composer_ids = changed
             return True
         except subprocess.TimeoutExpired:
             return False
@@ -317,6 +476,8 @@ class S3Backend(SyncBackend):
         self.prefix = prefix.rstrip("/") + "/"
         self.region = region
         self._client = None
+        self.last_pull_tip: Optional[str] = None
+        self.last_changed_composer_ids: Optional[set[str]] = None
 
     def _get_client(self):
         if self._client is None:
@@ -337,8 +498,13 @@ class S3Backend(SyncBackend):
 
     # -- SyncBackend interface ------------------------------------------
 
-    def pull(self, snapshots_dir: Path) -> bool:
-        """Download all remote snapshot files that are newer or missing locally."""
+    def pull(self, snapshots_dir: Path, previous_tip: Optional[str] = None) -> bool:
+        """Download all remote snapshot files that are newer or missing locally.
+
+        *previous_tip* ignored (git-only); always effectively a full remote scan.
+        """
+        self.last_pull_tip = None
+        self.last_changed_composer_ids = None
         client = self._get_client()
         try:
             paginator = client.get_paginator("list_objects_v2")
@@ -374,8 +540,12 @@ class S3Backend(SyncBackend):
             print(f"S3 pull failed: {e}", file=sys.stderr)
             return False
 
-    def push(self, snapshots_dir: Path) -> bool:
-        """Upload local snapshot files that are newer or missing remotely."""
+    def push(self, snapshots_dir: Path, paths: Optional[list[Path]] = None) -> bool:
+        """Upload local snapshot files that are newer or missing remotely.
+
+        *paths* is accepted for API compatibility with GitBackend; S3 still
+        scans the snapshots tree (mtime/size skip).
+        """
         client = self._get_client()
         try:
             # Build index of remote objects

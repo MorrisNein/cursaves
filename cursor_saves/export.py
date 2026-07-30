@@ -3,6 +3,7 @@
 import gzip
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -12,6 +13,31 @@ from typing import Any, Optional
 from . import db, paths
 from . import plans as plan_sync
 
+# Content blob keys are composer.content.{64-hex}
+_CONTENT_HASH_RE = re.compile(r"\b[a-f0-9]{64}\b")
+
+
+def _collect_content_hashes(*objs: Any) -> set[str]:
+    """Exact hex hashes referenced anywhere in the given JSON-serializable objects."""
+    try:
+        text = json.dumps(objs, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return set()
+    return set(_CONTENT_HASH_RE.findall(text))
+
+
+def _fetch_content_blobs(cdb: db.CursorDB, hashes: set[str]) -> dict[str, str]:
+    """Load composer.content.* values for the given hashes only."""
+    if not hashes:
+        return {}
+    keys = [f"composer.content.{h}" for h in hashes]
+    items = cdb.get_items_by_keys(keys, table="cursorDiskKV")
+    blobs: dict[str, str] = {}
+    prefix = "composer.content."
+    for key, val in items.items():
+        if key.startswith(prefix) and val is not None:
+            blobs[key[len(prefix):]] = val
+    return blobs
 
 def get_workspace_conversations(
     project_path: str,
@@ -134,8 +160,8 @@ def get_conversation_data(composer_id: str) -> Optional[dict]:
 def get_content_blobs(composer_id: str) -> dict[str, str]:
     """Fetch all content blobs referenced by a conversation.
 
-    Scans the conversation data for content hash references and
-    retrieves them from the global DB.
+    Collects content hash references from conversation data and retrieves
+    only those keys from the global DB (no full-table prefix scan).
     """
     global_db = paths.get_global_db_path()
     if not global_db.exists():
@@ -145,24 +171,17 @@ def get_content_blobs(composer_id: str) -> dict[str, str]:
     if not conv_data:
         return {}
 
-    # Serialise once for searching
-    conv_json = json.dumps(conv_data)
-
-    # Collect all content hashes referenced in the conversation
-    # They appear in fullConversationHeadersOnly as bubbleId references
-    # and the actual content is stored under composer.content.{hash}
-    blobs = {}
+    hashes = _collect_content_hashes(conv_data)
+    # Also scan bubble bodies for hash refs
     try:
         with db.CursorDB(global_db) as cdb:
-            content_items = cdb.get_items_by_prefix("composer.content.")
-            for key, val in content_items.items():
-                content_hash = key[len("composer.content."):]
-                if content_hash in conv_json:
-                    blobs[content_hash] = val
+            bubble_prefix = f"bubbleId:{composer_id}:"
+            bubbles = cdb.get_json_items_by_prefix(bubble_prefix)
+            if bubbles:
+                hashes |= _collect_content_hashes(bubbles)
+            return _fetch_content_blobs(cdb, hashes)
     except (OSError, FileNotFoundError):
-        pass  # Non-fatal: content blobs are supplementary
-
-    return blobs
+        return {}
 
 
 def get_message_contexts(composer_id: str) -> dict[str, Any]:
@@ -438,14 +457,9 @@ def export_conversation(
                 bubble_id = key[len(bubble_prefix):]
                 bubbles[bubble_id] = val
 
-        # Content blobs referenced by this conversation
-        conv_json = json.dumps(conv_data)
-        blobs = {}
-        content_items = _cdb.get_items_by_prefix("composer.content.")
-        for key, val in content_items.items():
-            content_hash = key[len("composer.content."):]
-            if content_hash in conv_json:
-                blobs[content_hash] = val
+        # Content blobs referenced by this conversation (exact keys only)
+        hashes = _collect_content_hashes(conv_data, bubbles)
+        blobs = _fetch_content_blobs(_cdb, hashes)
 
         # Message request contexts
         contexts = {}
@@ -605,15 +619,21 @@ def checkpoint_project(
     composer_ids: Optional[list[str]] = None,
     workspace_dir: Optional[Path] = None,
     source_host: Optional[str] = None,
+    skip_empty: Optional[bool] = None,
 ) -> list[Path]:
     """Export conversations for a project to snapshots/.
 
     If composer_ids is given, only export those conversations.
     If workspace_dir is given, only reads from that specific workspace.
     Otherwise, export all conversations from all matching workspaces.
+    Empty unnamed stubs are skipped on bulk export only
+    (``skip_empty`` defaults to ``composer_ids is None``).
 
     Returns list of saved snapshot file paths.
     """
+    if skip_empty is None:
+        skip_empty = composer_ids is None
+
     snapshots_dir = paths.get_snapshots_dir()
 
     t0 = time.time()
@@ -621,7 +641,7 @@ def checkpoint_project(
     conversations = get_workspace_conversations(project_path, workspace_dir=workspace_dir)
     print(f"  Found {len(conversations)} conversation(s) in workspace(s)", file=sys.stderr, flush=True)
 
-    # Filter to selected ids and count how many we'll actually process
+    # Filter to selected ids
     to_process: list[tuple[dict, str]] = []
     for c in conversations:
         composer_id: str | None = c.get("composerId")
@@ -631,24 +651,38 @@ def checkpoint_project(
             continue
         to_process.append((c, composer_id))
 
-    print(f"  Processing {len(to_process)} conversation(s)...", file=sys.stderr, flush=True)
+    print(f"  Processing up to {len(to_process)} conversation(s)...", file=sys.stderr, flush=True)
 
     last_log_time = t0
     saved = []
+    skipped_empty = 0
     global_db = paths.get_global_db_path()
     with db.CursorDB(global_db) as cdb:
         for i, (c, composer_id) in enumerate(to_process, 1):
-            # Export the conversation
-            snapshot = export_conversation(project_path, composer_id, _cdb=cdb, source_host=source_host)
+            if skip_empty:
+                cd = cdb.get_json(f"composerData:{composer_id}") or {}
+                name = (cd.get("name") or c.get("name") or "").strip()
+                headers = cd.get("fullConversationHeadersOnly") or []
+                if not name and not headers:
+                    skipped_empty += 1
+                    continue
+            snapshot = export_conversation(
+                project_path, composer_id, _cdb=cdb, source_host=source_host
+            )
             if snapshot:
                 path = save_snapshot(snapshot, snapshots_dir)
                 saved.append(path)
-            
-            # Log progress: every 10 items, or every 10 seconds since last log
+
             if i % 10 == 0 or (time.time() - last_log_time) >= 10:
                 print(f"  [{i}/{len(to_process)}] {composer_id}", file=sys.stderr, flush=True)
                 last_log_time = time.time()
 
+    if skipped_empty:
+        print(
+            f"  Skipped {skipped_empty} empty unnamed conversation(s)",
+            file=sys.stderr,
+            flush=True,
+        )
     total = time.time() - t0
     print(f"  Completed in {total:.1f}s", file=sys.stderr, flush=True)
     return saved
