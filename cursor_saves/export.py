@@ -619,17 +619,21 @@ def checkpoint_project(
     composer_ids: Optional[list[str]] = None,
     workspace_dir: Optional[Path] = None,
     source_host: Optional[str] = None,
-    skip_empty: bool = True,
+    skip_empty: Optional[bool] = None,
 ) -> list[Path]:
     """Export conversations for a project to snapshots/.
 
     If composer_ids is given, only export those conversations.
     If workspace_dir is given, only reads from that specific workspace.
     Otherwise, export all conversations from all matching workspaces.
-    Empty unnamed stubs are skipped when skip_empty is True (default).
+    Empty unnamed stubs are skipped on bulk export only
+    (``skip_empty`` defaults to ``composer_ids is None``).
 
     Returns list of saved snapshot file paths.
     """
+    if skip_empty is None:
+        skip_empty = composer_ids is None
+
     snapshots_dir = paths.get_snapshots_dir()
 
     t0 = time.time()

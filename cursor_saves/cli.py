@@ -56,16 +56,18 @@ def _delete_snapshot(path: Path):
 
 
 def _ensure_synced() -> None:
-    """Pull latest from remote to ensure we have the latest state."""
+    """Pull latest from remote to ensure we have the latest state.
+
+    Does not advance ``lastSuccessfulRemoteTip`` — tip only moves after a
+    successful import that covers the full remote delta.
+    """
     if paths.is_sync_repo_initialized():
         backend = get_backend()
         snapshots_dir = paths.get_snapshots_dir()
         if backend.has_remote():
             tip = _load_sync_state().get("lastSuccessfulRemoteTip")
             if isinstance(backend, GitBackend):
-                if backend.pull(snapshots_dir, previous_tip=tip):
-                    if backend.last_pull_tip:
-                        _mark_pull_tip(backend.last_pull_tip)
+                backend.pull(snapshots_dir, previous_tip=tip)
             else:
                 backend.pull(snapshots_dir)
 
@@ -799,6 +801,69 @@ def _mark_pull_tip(tip: Optional[str]) -> None:
     _save_sync_state(state)
 
 
+def _composer_in_snapshot_dir(snap_dir: Path, composer_id: str) -> bool:
+    """True if a snapshot (meta or body) for composer_id exists under snap_dir."""
+    if not snap_dir.is_dir():
+        return False
+    if (snap_dir / f"{composer_id}.meta.json").exists():
+        return True
+    if (snap_dir / f"{composer_id}.json.gz").exists():
+        return True
+    if (snap_dir / f"{composer_id}.json").exists():
+        return True
+    return any(snap_dir.glob(f"{composer_id}.json.gz.*"))
+
+
+def _remote_delta_fully_covered(
+    changed_ids: Optional[set[str]],
+    *,
+    project_path: Optional[str] = None,
+) -> bool:
+    """Whether advancing lastSuccessfulRemoteTip is safe after this import.
+
+    - Empty delta: covered (nothing to import).
+    - Unknown full set (``None``): only when import was global (no project scope).
+    - Scoped project: every changed id that lives under another project means
+      the delta was filtered — do not advance.
+    """
+    if changed_ids is None:
+        return project_path is None
+    if not changed_ids:
+        return True
+    if project_path is None:
+        return True
+
+    project_id = paths.get_project_identifier(project_path)
+    snap_root = paths.get_snapshots_dir()
+    project_dir = snap_root / project_id
+    for cid in changed_ids:
+        if _composer_in_snapshot_dir(project_dir, cid):
+            continue
+        # Lives under a different project → scoped pull left it unprocessed
+        if snap_root.is_dir():
+            for d in snap_root.iterdir():
+                if not d.is_dir() or d.name == project_id:
+                    continue
+                if _composer_in_snapshot_dir(d, cid):
+                    return False
+    return True
+
+
+def _maybe_advance_pull_tip(
+    tip: Optional[str],
+    *,
+    failure: int,
+    changed_ids: Optional[set[str]],
+    project_path: Optional[str] = None,
+) -> None:
+    """Advance tip only after a successful import covering the full delta."""
+    if not tip or failure > 0:
+        return
+    if not _remote_delta_fully_covered(changed_ids, project_path=project_path):
+        return
+    _mark_pull_tip(tip)
+
+
 def _push_ahead(
     sync_dir: Path,
     auto: bool = False,
@@ -930,24 +995,29 @@ def _pull_behind(
     target_project_path: Optional[str] = None,
     target_workspace_dir: Optional[Path] = None,
     composer_ids: Optional[set[str]] = None,
-) -> int:
-    """Find all snapshots where local is behind and import them automatically.
+) -> tuple[int, int]:
+    """Find snapshots needing import and import them automatically.
 
-    For each behind/new snapshot, finds workspaces that already have the
-    conversation registered and imports only into those.  This prevents
-    duplicating imports across every matching workspace.
+    For each candidate, finds workspaces that already have the conversation
+    registered and imports only into those.  This prevents duplicating imports
+    across every matching workspace.
 
-    If *composer_ids* is a set, only those composers are considered (git delta).
-    An empty set means nothing changed on remote.
+    If *composer_ids* is a set, those are git-delta candidates — each always
+    goes through ``import_snapshot`` (conflict check + plan heal). An empty
+    set means nothing changed on remote.
 
-    Returns the number of snapshots successfully imported.
+    When *composer_ids* is None (full scan), behind/not_local are imported;
+    up_to_date/local_ahead with ``planCount`` still go through import_snapshot
+    so plan heal is not skipped.
+
+    Returns (imported_count, failure_count).
     """
     if composer_ids is not None and len(composer_ids) == 0:
-        return 0
+        return 0, 0
 
     projects = list_snapshot_projects()
     if not projects:
-        return 0
+        return 0, 0
 
     if target_project_path:
         target_project_id = paths.get_project_identifier(target_project_path)
@@ -960,6 +1030,7 @@ def _pull_behind(
     handled = sync_state.get("handled_diverged", {})
 
     total_imported = 0
+    total_failure = 0
     backed_up_global = False
     backed_up_ws: set[str] = set()
 
@@ -969,7 +1040,7 @@ def _pull_behind(
             if not snapshot_files:
                 continue
 
-            behind_snapshots: list[tuple[Path, dict]] = []
+            to_import: list[tuple[Path, dict]] = []
             for sf in snapshot_files:
                 meta = read_snapshot_meta(sf)
                 cid = meta.get("composerId")
@@ -984,11 +1055,20 @@ def _pull_behind(
                 if prev_handled and prev_handled >= msg_count:
                     continue
 
-                status = get_sync_status_for_snapshot(cid, msg_count, _cdb=global_cdb)
-                if status in ("behind", "not_local"):
-                    behind_snapshots.append((sf, meta))
+                if composer_ids is not None:
+                    # Delta candidate: always full import_snapshot
+                    to_import.append((sf, meta))
+                    continue
 
-            if not behind_snapshots:
+                status = get_sync_status_for_snapshot(cid, msg_count, _cdb=global_cdb)
+                plan_count = meta.get("planCount") or 0
+                if status in ("behind", "not_local"):
+                    to_import.append((sf, meta))
+                elif status in ("up_to_date", "local_ahead") and plan_count > 0:
+                    # Plan heal without requiring a behind chat body
+                    to_import.append((sf, meta))
+
+            if not to_import:
                 continue
 
             # Find all matching workspaces for this project
@@ -1015,12 +1095,12 @@ def _pull_behind(
                 if not ws_db_path.exists():
                     continue
                 ws_composer_ids = set(paths.get_workspace_composer_ids(ws_db_path))
-                for sf, meta in behind_snapshots:
+                for sf, meta in to_import:
                     cid = meta.get("composerId", "")
                     if cid in ws_composer_ids:
                         cid_to_workspaces.setdefault(cid, []).append(ws)
 
-            for sf, meta in behind_snapshots:
+            for sf, meta in to_import:
                 cid = meta.get("composerId", "")
                 target_list = cid_to_workspaces.get(cid, [])
 
@@ -1047,6 +1127,8 @@ def _pull_behind(
                     )
                     if ok:
                         total_imported += 1
+                    else:
+                        total_failure += 1
 
                 # Record that we've handled this snapshot at this message count
                 # so diverged conversations don't get re-imported every sync
@@ -1060,7 +1142,7 @@ def _pull_behind(
     sync_state["handled_diverged"] = handled
     _save_sync_state(sync_state)
 
-    return total_imported
+    return total_imported, total_failure
 
 
 def cmd_repair(args):
@@ -1112,7 +1194,7 @@ def cmd_sync(args):
 
     # Step 2: Import — pull behind conversations from snapshots into Cursor DBs
     print("\n── Pull ──")
-    imported = _pull_behind(
+    imported, pull_failure = _pull_behind(
         sync_dir,
         target_project_path=target_project_path,
         target_workspace_dir=target_workspace_dir,
@@ -1122,7 +1204,12 @@ def cmd_sync(args):
         print(f"  Imported {imported} conversation(s)")
     else:
         print("  Everything up to date")
-    _mark_pull_tip(new_tip)
+    _maybe_advance_pull_tip(
+        new_tip,
+        failure=pull_failure,
+        changed_ids=changed_ids,
+        project_path=target_project_path,
+    )
 
     # Step 3: Push — export ahead conversations from Cursor DBs into snapshots
     print("\n── Push ──")
@@ -1214,43 +1301,36 @@ def cmd_push(args):
         print(f"\nCheckpointing {len(composer_ids)} conversation(s)...")
         total = _export_and_push(sync_dir, items, backend=backend, chunk_size=chunk_size)
     else:
-        # --all for current workspace: checkpoint all then push in chunks via ahead list
+        # --all: re-export every conversation in the workspace (not only ahead)
         print(f"Checkpointing all conversations for {project_path}...")
-        # Use find-ahead scoped to this workspace for chunked push of everything selected
-        all_items = _find_ahead_conversations(
-            target_project_path=project_path,
-            target_workspace_dir=workspace_dir,
-            include_never_pushed=True,
+        saved = export.checkpoint_project(
+            project_path,
+            workspace_dir=workspace_dir,
+            source_host=source_host,
         )
-        if not all_items:
-            # Fall back: export everything then one push (still chunked by re-listing)
-            saved = export.checkpoint_project(
-                project_path,
-                workspace_dir=workspace_dir,
-                source_host=source_host,
-            )
-            if not saved:
-                print("No conversations found to checkpoint.")
-                return
-            # Push in path chunks of 10
-            for i in range(0, len(saved), chunk_size):
-                batch = saved[i : i + chunk_size]
-                bn = i // chunk_size + 1
-                tb = (len(saved) + chunk_size - 1) // chunk_size
-                print(f"  [batch {bn}/{tb}] Pushing {len(batch)} file(s)...", end="", flush=True)
-                if backend.has_remote():
-                    if backend.push(snapshots_dir, paths=batch):
-                        print(" done")
-                    else:
-                        print(" failed", file=sys.stderr)
-                        return
-                else:
-                    if isinstance(backend, GitBackend):
-                        backend.push(snapshots_dir, paths=batch)
-                    print(" done")
-            print(f"\nDone. {len(saved)} conversation(s) saved.")
+        if not saved:
+            print("No conversations found to checkpoint.")
             return
-        total = _export_and_push(sync_dir, all_items, backend=backend, chunk_size=chunk_size)
+        # Push pending commits first, then stage/push in chunks of --chunk
+        if backend.has_remote() and isinstance(backend, GitBackend):
+            backend.push(snapshots_dir, paths=[])
+        for i in range(0, len(saved), chunk_size):
+            batch = saved[i : i + chunk_size]
+            bn = i // chunk_size + 1
+            tb = (len(saved) + chunk_size - 1) // chunk_size
+            print(f"  [batch {bn}/{tb}] Pushing {len(batch)} file(s)...", end="", flush=True)
+            if backend.has_remote():
+                if backend.push(snapshots_dir, paths=batch):
+                    print(" done")
+                else:
+                    print(" failed", file=sys.stderr)
+                    return
+            else:
+                if isinstance(backend, GitBackend):
+                    backend.push(snapshots_dir, paths=batch)
+                print(" done")
+        print(f"\nDone. {len(saved)} conversation(s) saved.")
+        return
 
     if not total:
         print("No conversations found to checkpoint.")
@@ -1293,14 +1373,19 @@ def cmd_pull(args):
     # If --global is set, pull behind chats for all workspaces
     if getattr(args, "global_sync", False):
         print("\n── Pull (Global) ──")
-        imported = _pull_behind(sync_dir, composer_ids=changed_ids)
+        imported, pull_failure = _pull_behind(sync_dir, composer_ids=changed_ids)
         if imported > 0:
             print(f"  Imported {imported} conversation(s)")
             from .reload import print_reload_hint
             print_reload_hint()
         else:
             print("  Everything up to date")
-        _mark_pull_tip(new_tip)
+        _maybe_advance_pull_tip(
+            new_tip,
+            failure=pull_failure,
+            changed_ids=changed_ids,
+            project_path=None,
+        )
         return
 
     # Step 2: Select what to import
@@ -1404,7 +1489,7 @@ def cmd_pull(args):
         print(f"\nDone: {total_success} imported, {total_failure} failed.")
         if total_success > 0:
             _maybe_reload(args)
-        _mark_pull_tip(new_tip)
+        # Interactive subset — never advance global tip (partial import).
     else:
         # Non-interactive: import for the resolved project/workspace
         project_path, workspace_dir = _resolve_workspace_for_import(args)
@@ -1427,7 +1512,12 @@ def cmd_pull(args):
             reconcile_all=reconcile_all,
         )
 
-        _mark_pull_tip(new_tip)
+        _maybe_advance_pull_tip(
+            new_tip,
+            failure=failure,
+            changed_ids=changed_ids,
+            project_path=project_path,
+        )
 
         if success == 0 and failure == 0:
             print("No snapshots to import (up to date or none found).")

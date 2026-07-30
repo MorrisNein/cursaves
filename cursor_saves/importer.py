@@ -832,12 +832,16 @@ def import_from_snapshot_dir(
         target_project_path: The project path on this machine.
         force: Suppress Cursor-running warning.
         target_workspace_dir: Optional workspace directory to import into.
-        composer_ids: If set, only consider these composer IDs (git delta).
-            ``None`` means all files in the directory.
-        reconcile_all: If True, import every file (no meta up-to-date skip).
+        composer_ids: If set, only these composer IDs (git delta candidates)
+            are imported via ``import_snapshot``. Non-candidates are never
+            decompressed. ``None`` means all files in the directory (full
+            reconcile / tip-miss fallback).
+        reconcile_all: Unused; kept for call-site compatibility. Full
+            reconcile is expressed as ``composer_ids is None``.
 
     Returns (success_count, failure_count).
     """
+    del reconcile_all  # full reconcile == composer_ids is None
     if not force and is_cursor_running():
         print(
             "WARNING: Cursor is running. Close Cursor FIRST (Cmd+Q / quit),\n"
@@ -847,46 +851,34 @@ def import_from_snapshot_dir(
             "Use --force to import anyway (not recommended).\n",
             file=sys.stderr,
         )
-        return 0, 0
+        # Treat as failure so callers do not advance lastSuccessfulRemoteTip.
+        return 0, 1
 
     snapshot_files = list_snapshot_files(snapshot_dir)
     if not snapshot_files:
         return 0, 0
 
-    global_db_path = paths.get_global_db_path()
-    global_cdb = db.CursorDB(global_db_path) if global_db_path.exists() else None
-
-    # Meta-first filter: skip gzip for up-to-date / out-of-delta chats
+    # Delta filter only: candidates always go through import_snapshot (conflict
+    # check + plan heal). Non-candidates: never gzip.
     to_import: list[Path] = []
     skipped = 0
-    try:
-        for sf in snapshot_files:
-            meta = read_snapshot_meta(sf)
-            cid = meta.get("composerId")
-            if not cid:
-                continue
-            if composer_ids is not None and cid not in composer_ids:
-                skipped += 1
-                continue
-            if not reconcile_all:
-                msg_count = meta.get("messageCount", 0)
-                status = get_sync_status_for_snapshot(
-                    cid, msg_count, _cdb=global_cdb
-                )
-                if status in ("up_to_date", "local_ahead"):
-                    skipped += 1
-                    continue
-            to_import.append(sf)
-    finally:
-        if global_cdb is not None:
-            global_cdb.close()
+    for sf in snapshot_files:
+        meta = read_snapshot_meta(sf)
+        cid = meta.get("composerId")
+        if not cid:
+            continue
+        if composer_ids is not None and cid not in composer_ids:
+            skipped += 1
+            continue
+        to_import.append(sf)
 
     if skipped:
-        print(f"  Skipping {skipped} unchanged snapshot(s) (no decompress)")
+        print(f"  Skipping {skipped} out-of-delta snapshot(s) (no decompress)")
     if not to_import:
         return 0, 0
 
     # Back up DBs once for the entire batch (global DB can be multi-GB)
+    global_db_path = paths.get_global_db_path()
     if global_db_path.exists():
         backup_path = db.backup_db(global_db_path)
         print(f"Backed up global DB to {backup_path.name}")
@@ -931,7 +923,7 @@ def import_all_snapshots(
         force: Suppress Cursor-running warning.
         target_workspace_dir: Optional workspace directory to import into.
         composer_ids: Optional git-delta filter (None = all in project dir).
-        reconcile_all: If True, do not skip up-to-date metas.
+        reconcile_all: Unused; full reconcile is ``composer_ids is None``.
 
     Returns (success_count, failure_count).
     """
@@ -944,7 +936,7 @@ def import_all_snapshots(
             "Use --force to import anyway (not recommended).\n",
             file=sys.stderr,
         )
-        return 0, 0
+        return 0, 1
 
     if snapshots_dir is None:
         snapshots_dir = paths.get_snapshots_dir()
@@ -966,7 +958,7 @@ def import_all_snapshots(
         )
 
     return import_from_snapshot_dir(
-        project_snapshots, target_project_path, force=force,
+        project_snapshots, target_project_path, force=True,
         target_workspace_dir=target_workspace_dir,
         composer_ids=composer_ids,
         reconcile_all=reconcile_all,

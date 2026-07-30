@@ -216,12 +216,13 @@ class GitBackend(SyncBackend):
             encoding="utf-8",
             errors="replace",
         )
+        # Fail-safe: if we can't check, assume unpushed so reset is refused.
         if r.returncode != 0:
-            return False
+            return True
         try:
             return int((r.stdout or "0").strip() or "0") > 0
         except ValueError:
-            return False
+            return True
 
     def has_remote(self) -> bool:
         try:
