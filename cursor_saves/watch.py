@@ -102,7 +102,7 @@ def _git_sync(repo_root: Path, project_path: str) -> tuple[bool, str]:
         if pull_result.returncode != 0:
             return False, f"git pull failed: {pull_result.stderr.strip()}"
 
-        # Stage snapshot files
+        # Stage snapshots; agent-config/ only when present (pathspec fails otherwise)
         add_result = subprocess.run(
             ["git", "add", "snapshots/"],
             capture_output=True,
@@ -112,6 +112,16 @@ def _git_sync(repo_root: Path, project_path: str) -> tuple[bool, str]:
         )
         if add_result.returncode != 0:
             return False, f"git add failed: {add_result.stderr.strip()}"
+        if (repo_root / "agent-config").exists():
+            agent_add = subprocess.run(
+                ["git", "add", "agent-config/"],
+                capture_output=True,
+                text=True,
+                cwd=str(repo_root),
+                timeout=10,
+            )
+            if agent_add.returncode != 0:
+                return False, f"git add failed: {agent_add.stderr.strip()}"
 
         # Check if there's anything to commit
         status_result = subprocess.run(

@@ -123,16 +123,18 @@ class GitBackend(SyncBackend):
         snapshots_dir: Path,
         paths: Optional[list[Path]] = None,
     ) -> bool:
-        """Commit snapshot changes and push. If *paths* given, stage only those."""
+        """Commit snapshot/agent-config changes and push. If *paths* given, stage those + agent-config/."""
         if paths is not None:
             if not paths:
                 return self._push_origin_only()
             self._stage_snapshot_paths(paths)
+            self._stage_agent_config()
         else:
             subprocess.run(
                 ["git", "add", "snapshots/"],
                 cwd=str(self.sync_dir), capture_output=True,
             )
+            self._stage_agent_config()
         result = subprocess.run(
             ["git", "diff", "--cached", "--quiet"],
             cwd=str(self.sync_dir), capture_output=True,
@@ -155,6 +157,16 @@ class GitBackend(SyncBackend):
                 return False
 
         return self._push_origin_only()
+
+    def _stage_agent_config(self) -> None:
+        """Stage agent-config/ when the directory exists under the sync repo."""
+        agent_dir = self.sync_dir / "agent-config"
+        if not agent_dir.exists():
+            return
+        subprocess.run(
+            ["git", "add", "agent-config/"],
+            cwd=str(self.sync_dir), capture_output=True,
+        )
 
     def _stage_snapshot_paths(self, paths: list[Path]) -> None:
         sync_root = self.sync_dir.resolve()
