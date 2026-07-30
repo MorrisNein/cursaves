@@ -377,25 +377,10 @@ def import_snapshot(
         print(f"  Skipping empty conversation {composer_id[:12]}...")
         return True  # Not an error, just nothing to import
 
-    # Resolve workspace early so composerData.workspaceIdentifier matches
-    # the canonical URI Cursor's Agents sidebar groups by.
-    if target_workspace_dir is not None:
-        ws_dir = target_workspace_dir
-    else:
-        ws_dir = find_or_create_workspace(target_path)
-    workspace_identifier = _normalize_workspace_identifier(
-        _build_workspace_identifier(ws_dir)
-    )
-
     # Rewrite paths if the project is at a different location
     if source_path and source_path != target_path:
         print(f"  Rewriting paths: {source_path} -> {target_path}")
         composer_data = rewrite_paths(composer_data, source_path, target_path)
-
-    if isinstance(composer_data, dict):
-        composer_data = dict(composer_data)
-        if workspace_identifier.get("id") or workspace_identifier.get("uri"):
-            composer_data["workspaceIdentifier"] = workspace_identifier
 
     content_blobs = snapshot.get("contentBlobs", {})
     message_contexts = snapshot.get("messageContexts", {})
@@ -458,6 +443,20 @@ def import_snapshot(
         print(
             f"            Importing as separate chat: \"{new_name}\""
         )
+
+    # Resolve workspace only after we know we will write — avoid creating
+    # empty workspaceStorage folders on identical/local_ahead skips.
+    if target_workspace_dir is not None:
+        ws_dir = target_workspace_dir
+    else:
+        ws_dir = find_or_create_workspace(target_path)
+    workspace_identifier = _normalize_workspace_identifier(
+        _build_workspace_identifier(ws_dir)
+    )
+    if isinstance(composer_data, dict):
+        composer_data = dict(composer_data)
+        if workspace_identifier.get("id") or workspace_identifier.get("uri"):
+            composer_data["workspaceIdentifier"] = workspace_identifier
 
     # ── Step 1: Backup global DB ────────────────────────────────────
     if not skip_backup and global_db_path.exists():
@@ -1304,6 +1303,11 @@ def normalize_remote_uri_authorities(
                 wi = entry.get("workspaceIdentifier")
                 if not isinstance(wi, dict):
                     continue
+                # SQL workspaceId is the sidebar index key — prefer it over
+                # a stale id embedded in the JSON value blob.
+                if workspace_id:
+                    wi = dict(wi)
+                    wi["id"] = workspace_id
                 uri = wi.get("uri") if isinstance(wi.get("uri"), dict) else None
                 if not uri or uri.get("scheme") != "vscode-remote":
                     continue
@@ -1403,6 +1407,10 @@ def _sync_composer_data_workspace_identifiers(
 ) -> tuple[int, int]:
     """Copy normalized composerHeaders.workspaceIdentifier into composerData.
 
+    Uses the SQL ``workspaceId`` column as the authoritative workspace hash
+    (same rule as ``list_native_composer_headers``), not a possibly stale
+    ``id`` embedded only in the JSON value blob.
+
     Returns (changed_count, scanned_count).
     """
     changed = 0
@@ -1412,10 +1420,10 @@ def _sync_composer_data_workspace_identifiers(
 
     conn = write_cdb._get_write_conn()
     rows = conn.execute(
-        "SELECT composerId, value FROM composerHeaders"
+        "SELECT composerId, workspaceId, value FROM composerHeaders"
     ).fetchall()
 
-    for cid, value in rows:
+    for cid, workspace_id, value in rows:
         if not value:
             continue
         try:
@@ -1429,6 +1437,9 @@ def _sync_composer_data_workspace_identifiers(
         wi = entry.get("workspaceIdentifier")
         if not isinstance(wi, dict):
             continue
+        if workspace_id:
+            wi = dict(wi)
+            wi["id"] = workspace_id
         uri = wi.get("uri") if isinstance(wi.get("uri"), dict) else None
         if not uri or uri.get("scheme") != "vscode-remote":
             continue
