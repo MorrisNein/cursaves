@@ -444,6 +444,20 @@ def import_snapshot(
             f"            Importing as separate chat: \"{new_name}\""
         )
 
+    # Resolve workspace only after we know we will write — avoid creating
+    # empty workspaceStorage folders on identical/local_ahead skips.
+    if target_workspace_dir is not None:
+        ws_dir = target_workspace_dir
+    else:
+        ws_dir = find_or_create_workspace(target_path)
+    workspace_identifier = _normalize_workspace_identifier(
+        _build_workspace_identifier(ws_dir)
+    )
+    if isinstance(composer_data, dict):
+        composer_data = dict(composer_data)
+        if workspace_identifier.get("id") or workspace_identifier.get("uri"):
+            composer_data["workspaceIdentifier"] = workspace_identifier
+
     # ── Step 1: Backup global DB ────────────────────────────────────
     if not skip_backup and global_db_path.exists():
         backup_path = db.backup_db(global_db_path)
@@ -504,10 +518,6 @@ def import_snapshot(
         global_cdb.close()
 
     # ── Step 3: Register conversation in workspace DB ───────────────
-    if target_workspace_dir is not None:
-        ws_dir = target_workspace_dir
-    else:
-        ws_dir = find_or_create_workspace(target_path)
     ws_db_path = ws_dir / "state.vscdb"
 
     if not skip_backup and ws_db_path.exists():
@@ -953,7 +963,12 @@ def _upsert_native_composer_header(
 
     # Ensure workspaceIdentifier is embedded in the JSON value Cursor stores.
     value_obj = dict(entry)
-    value_obj["workspaceIdentifier"] = wi
+    wi = value_obj.get("workspaceIdentifier")
+    if isinstance(wi, dict):
+        value_obj["workspaceIdentifier"] = _normalize_workspace_identifier(wi)
+        entry = value_obj
+    else:
+        value_obj["workspaceIdentifier"] = wi
     value_json = json.dumps(value_obj, separators=(",", ":"), ensure_ascii=False)
 
     conn = global_cdb._get_write_conn()
@@ -1074,18 +1089,82 @@ def _build_workspace_identifier(ws_dir: Path) -> dict:
     elif folder_uri.startswith("vscode-remote://"):
         from urllib.parse import unquote
         parts = folder_uri.split("/", 3)
-        authority = unquote(parts[2]) if len(parts) > 2 else ""
-        fs_path = "/" + parts[3] if len(parts) > 3 else "/"
-        uri_obj["fsPath"] = fs_path
+        # Lowercase authority so Cursor sidebar doesn't split one repo into
+        # two folders when Distro casing differs (wsl+Ubuntu vs wsl+ubuntu).
+        authority = unquote(parts[2]).lower() if len(parts) > 2 else ""
+        path = "/" + parts[3] if len(parts) > 3 else "/"
+        if not path.startswith("/"):
+            path = "/" + path
+        ext_auth = authority.replace("+", "%2B")
+        # Cursor on Windows stores remote fsPath with backslashes; mixing
+        # "/home/..." and "\home\..." also splits the Agents sidebar.
+        uri_obj["fsPath"] = path.replace("/", "\\")
         uri_obj["_sep"] = 1
-        uri_obj["path"] = fs_path
-        uri_obj["external"] = folder_uri
+        uri_obj["path"] = path
+        uri_obj["external"] = f"vscode-remote://{ext_auth}{path}"
         uri_obj["scheme"] = "vscode-remote"
         uri_obj["authority"] = authority
     else:
         return {"id": ws_hash}
 
     return {"id": ws_hash, "uri": uri_obj}
+
+
+def _normalize_workspace_identifier(wi: dict) -> dict:
+    """Return a copy of workspaceIdentifier with stable vscode-remote URI fields.
+
+    Cursor's Agents sidebar can split one workspace hash into duplicate folder
+    headers when either:
+      - ``uri.authority`` casing differs (``wsl+Ubuntu-24.04`` vs ``wsl+ubuntu-24.04``)
+      - ``uri.fsPath`` slash style differs (``/home/...`` vs ``\\home\\...``)
+    """
+    if not isinstance(wi, dict):
+        return wi
+    out = dict(wi)
+    uri = out.get("uri")
+    if not isinstance(uri, dict):
+        return out
+    if uri.get("scheme") != "vscode-remote":
+        return out
+    auth = uri.get("authority") or ""
+    if not auth:
+        return out
+    auth_norm = auth.lower()
+    path = uri.get("path") or "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    # Rebuild with stable key order — Cursor may group on revived URI identity,
+    # and mixed JSON field order previously left two equivalent-looking dumps.
+    out["uri"] = {
+        "$mid": uri.get("$mid", 1),
+        "fsPath": path.replace("/", "\\"),
+        "_sep": 1,
+        "external": f"vscode-remote://{auth_norm.replace('+', '%2B')}{path}",
+        "path": path,
+        "scheme": "vscode-remote",
+        "authority": auth_norm,
+    }
+    return out
+
+
+def _workspace_uri_fingerprint(wi: dict | None) -> str:
+    """Stable compare key for workspaceIdentifier.uri fields we normalize."""
+    if not isinstance(wi, dict):
+        return ""
+    uri = wi.get("uri")
+    if not isinstance(uri, dict):
+        return ""
+    return json.dumps(
+        {
+            "scheme": uri.get("scheme"),
+            "authority": uri.get("authority"),
+            "path": uri.get("path"),
+            "fsPath": uri.get("fsPath"),
+            "external": uri.get("external"),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
 
 
 def _register_in_global_headers(
@@ -1109,8 +1188,11 @@ def _register_in_global_headers(
             headers = {"allComposers": []}
 
         all_composers = headers.get("allComposers", [])
+        workspace_identifier = _normalize_workspace_identifier(
+            _build_workspace_identifier(ws_dir)
+        )
         entry = _build_composer_header_entry(composer_id, composer_data)
-        entry["workspaceIdentifier"] = _build_workspace_identifier(ws_dir)
+        entry["workspaceIdentifier"] = workspace_identifier
 
         replaced = False
         for i, existing in enumerate(all_composers):
@@ -1124,9 +1206,282 @@ def _register_in_global_headers(
         headers["allComposers"] = all_composers
         global_cdb.write_json("composer.composerHeaders", headers, table="ItemTable")
         _upsert_native_composer_header(global_cdb, entry, composer_data)
+        # Agents sidebar also reads composerData.workspaceIdentifier — keep
+        # it aligned with headers so import/recover don't reintroduce splits.
+        _ensure_composer_data_workspace_identifier(
+            global_cdb, composer_id, workspace_identifier
+        )
         paths.invalidate_headers_cache()
     finally:
         global_cdb.close()
+
+
+def _ensure_composer_data_workspace_identifier(
+    cdb: "db.CursorDB",
+    composer_id: str,
+    workspace_identifier: dict,
+) -> bool:
+    """Set composerData.workspaceIdentifier if missing or drifted. Returns True if wrote."""
+    if not workspace_identifier:
+        return False
+    cd_key = f"composerData:{composer_id}"
+    data = cdb.get_json(cd_key, table="cursorDiskKV")
+    if data is None or not isinstance(data, dict):
+        return False
+    cur_wi = data.get("workspaceIdentifier")
+    if (
+        isinstance(cur_wi, dict)
+        and cur_wi.get("id") == workspace_identifier.get("id")
+        and _workspace_uri_fingerprint(cur_wi)
+        == _workspace_uri_fingerprint(workspace_identifier)
+        and json.dumps(cur_wi, ensure_ascii=False, separators=(",", ":"))
+        == json.dumps(workspace_identifier, ensure_ascii=False, separators=(",", ":"))
+    ):
+        return False
+    data = dict(data)
+    data["workspaceIdentifier"] = workspace_identifier
+    cdb.write_json(cd_key, data, table="cursorDiskKV")
+    return True
+
+
+def normalize_remote_uri_authorities(
+    dry_run: bool = False,
+    force: bool = False,
+) -> tuple[int, int]:
+    """Normalize vscode-remote workspace URIs in global chat indexes.
+
+    Fixes Cursor sidebar splitting one WSL/SSH workspace into duplicate
+    folder headers when Distro/host casing or fsPath slash style differs
+    across chats.
+
+    Updates both the native ``composerHeaders`` SQL table and ItemTable
+    ``composer.composerHeaders`` JSON.
+
+    Returns (changed_count, scanned_count).
+    """
+    if not dry_run and not force and is_cursor_running():
+        print(
+            "WARNING: Cursor is running. Close Cursor FIRST (Cmd+Q / quit),\n"
+            "then run this command, then reopen Cursor.\n"
+            "Use --force to override (not recommended).\n",
+            file=sys.stderr,
+        )
+        return 0, 0
+
+    global_db_path = paths.get_global_db_path()
+    if not global_db_path.exists():
+        print("Global DB not found.", file=sys.stderr)
+        return 0, 0
+
+    if not dry_run:
+        backup_path = db.backup_db(global_db_path)
+        print(f"Backed up global DB to {backup_path.name}")
+
+    changed = 0
+    scanned = 0
+
+    write_cdb = db.CursorDB(global_db_path)
+    try:
+        # --- Native SQL table ---
+        if _native_composer_headers_exists(write_cdb):
+            conn = write_cdb._get_write_conn()
+            rows = conn.execute(
+                "SELECT composerId, workspaceId, value FROM composerHeaders"
+            ).fetchall()
+            for cid, workspace_id, value in rows:
+                scanned += 1
+                if not value:
+                    continue
+                try:
+                    if isinstance(value, bytes):
+                        value = value.decode("utf-8", errors="replace")
+                    entry = json.loads(value)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                wi = entry.get("workspaceIdentifier")
+                if not isinstance(wi, dict):
+                    continue
+                # SQL workspaceId is the sidebar index key — prefer it over
+                # a stale id embedded in the JSON value blob.
+                if workspace_id:
+                    wi = dict(wi)
+                    wi["id"] = workspace_id
+                uri = wi.get("uri") if isinstance(wi.get("uri"), dict) else None
+                if not uri or uri.get("scheme") != "vscode-remote":
+                    continue
+                new_wi = _normalize_workspace_identifier(wi)
+                if json.dumps(new_wi, ensure_ascii=False, separators=(",", ":")) == json.dumps(
+                    wi, ensure_ascii=False, separators=(",", ":")
+                ):
+                    continue
+                old_auth = (uri or {}).get("authority") or ""
+                old_fs = (uri or {}).get("fsPath") or ""
+                new_uri = (new_wi.get("uri") or {}) if isinstance(new_wi.get("uri"), dict) else {}
+                new_auth = new_uri.get("authority") or ""
+                new_fs = new_uri.get("fsPath") or ""
+                entry = dict(entry)
+                entry["workspaceIdentifier"] = new_wi
+                name = entry.get("name") or "(unnamed)"
+                print(
+                    f"  {'Would fix' if dry_run else 'Fixed'}: "
+                    f"{cid[:8]}… \"{name[:40]}\" "
+                    f"auth {old_auth!r}->{new_auth!r} "
+                    f"fsPath {old_fs!r}->{new_fs!r}"
+                )
+                changed += 1
+                if dry_run:
+                    continue
+                value_json = json.dumps(
+                    entry, separators=(",", ":"), ensure_ascii=False
+                )
+                conn.execute(
+                    "UPDATE composerHeaders SET value=? WHERE composerId=?",
+                    (value_json, cid),
+                )
+            if not dry_run and not write_cdb._in_transaction:
+                conn.commit()
+
+        # --- ItemTable JSON ---
+        headers = write_cdb.get_json(
+            "composer.composerHeaders", table="ItemTable"
+        )
+        if headers and isinstance(headers, dict):
+            all_composers = headers.get("allComposers", [])
+            json_changed = False
+            for i, entry in enumerate(all_composers):
+                if not isinstance(entry, dict):
+                    continue
+                scanned += 1
+                wi = entry.get("workspaceIdentifier")
+                if not isinstance(wi, dict):
+                    continue
+                uri = wi.get("uri") if isinstance(wi.get("uri"), dict) else None
+                if not uri or uri.get("scheme") != "vscode-remote":
+                    continue
+                new_wi = _normalize_workspace_identifier(wi)
+                if json.dumps(new_wi, ensure_ascii=False, separators=(",", ":")) == json.dumps(
+                    wi, ensure_ascii=False, separators=(",", ":")
+                ):
+                    continue
+                if dry_run:
+                    changed += 1
+                    continue
+                entry = dict(entry)
+                entry["workspaceIdentifier"] = new_wi
+                all_composers[i] = entry
+                json_changed = True
+                changed += 1
+            if json_changed and not dry_run:
+                headers["allComposers"] = all_composers
+                write_cdb.write_json(
+                    "composer.composerHeaders", headers, table="ItemTable"
+                )
+
+        # composerData.workspaceIdentifier can disagree with composerHeaders.
+        # Agents sidebar often follows composerData, which causes duplicate
+        # verme-chat-ai folders (e.g. wsl+ubuntu vs wsl+ubuntu-24.04) and
+        # "jumping" chats when one side is null and the other is set.
+        cd_changed, cd_scanned = _sync_composer_data_workspace_identifiers(
+            write_cdb, dry_run=dry_run
+        )
+        changed += cd_changed
+        scanned += cd_scanned
+    finally:
+        write_cdb.close()
+
+    paths.invalidate_headers_cache()
+    if dry_run:
+        print(f"\n{changed} header(s)/composerData would be normalized ({scanned} scanned).")
+    else:
+        print(f"\nNormalized {changed} header(s)/composerData ({scanned} scanned).")
+        if changed:
+            print("Restart Cursor to refresh the sidebar grouping.")
+    return changed, scanned
+
+
+def _sync_composer_data_workspace_identifiers(
+    write_cdb: "db.CursorDB",
+    dry_run: bool = False,
+) -> tuple[int, int]:
+    """Copy normalized composerHeaders.workspaceIdentifier into composerData.
+
+    Uses the SQL ``workspaceId`` column as the authoritative workspace hash
+    (same rule as ``list_native_composer_headers``), not a possibly stale
+    ``id`` embedded only in the JSON value blob.
+
+    Returns (changed_count, scanned_count).
+    """
+    changed = 0
+    scanned = 0
+    if not _native_composer_headers_exists(write_cdb):
+        return 0, 0
+
+    conn = write_cdb._get_write_conn()
+    rows = conn.execute(
+        "SELECT composerId, workspaceId, value FROM composerHeaders"
+    ).fetchall()
+
+    for cid, workspace_id, value in rows:
+        if not value:
+            continue
+        try:
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", errors="replace")
+            entry = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(entry, dict):
+            continue
+        wi = entry.get("workspaceIdentifier")
+        if not isinstance(wi, dict):
+            continue
+        if workspace_id:
+            wi = dict(wi)
+            wi["id"] = workspace_id
+        uri = wi.get("uri") if isinstance(wi.get("uri"), dict) else None
+        if not uri or uri.get("scheme") != "vscode-remote":
+            continue
+
+        target_wi = _normalize_workspace_identifier(wi)
+        scanned += 1
+
+        cd_key = f"composerData:{cid}"
+        data = write_cdb.get_json(cd_key, table="cursorDiskKV")
+        if data is None or not isinstance(data, dict):
+            continue
+
+        cur_wi = data.get("workspaceIdentifier")
+        same = (
+            isinstance(cur_wi, dict)
+            and _workspace_uri_fingerprint(cur_wi) == _workspace_uri_fingerprint(target_wi)
+            and cur_wi.get("id") == target_wi.get("id")
+        )
+        if same:
+            continue
+
+        old_id = (cur_wi or {}).get("id") if isinstance(cur_wi, dict) else None
+        old_auth = None
+        if isinstance(cur_wi, dict):
+            old_uri = cur_wi.get("uri") if isinstance(cur_wi.get("uri"), dict) else {}
+            old_auth = (old_uri or {}).get("authority")
+        new_auth = ((target_wi.get("uri") or {}).get("authority") if isinstance(target_wi.get("uri"), dict) else None)
+        name = entry.get("name") or data.get("name") or "(unnamed)"
+        print(
+            f"  {'Would sync' if dry_run else 'Synced'} composerData: "
+            f"{cid[:8]}… \"{str(name)[:40]}\" "
+            f"id {old_id!r}->{target_wi.get('id')!r} "
+            f"auth {old_auth!r}->{new_auth!r}"
+        )
+        changed += 1
+        if dry_run:
+            continue
+        data = dict(data)
+        data["workspaceIdentifier"] = target_wi
+        write_cdb.write_json(cd_key, data, table="cursorDiskKV")
+
+    return changed, scanned
 
 
 def _register_in_workspace(
@@ -1524,8 +1879,25 @@ def doctor_audit() -> dict:
     orphaned = []
     registered_count = 0
     empty_count = 0
+    uri_drift = []
 
     with db.CursorDB(global_db_path) as cdb:
+        # Map header workspaceIdentifier by composerId (SQL + JSON)
+        header_wi: dict[str, dict] = {}
+        for entry in cdb.list_native_composer_headers():
+            cid = entry.get("composerId")
+            wi = entry.get("workspaceIdentifier")
+            if cid and isinstance(wi, dict):
+                header_wi[cid] = wi
+        json_headers = cdb.get_json("composer.composerHeaders", table="ItemTable") or {}
+        for entry in json_headers.get("allComposers", []) if isinstance(json_headers, dict) else []:
+            if not isinstance(entry, dict):
+                continue
+            cid = entry.get("composerId")
+            wi = entry.get("workspaceIdentifier")
+            if cid and isinstance(wi, dict) and cid not in header_wi:
+                header_wi[cid] = wi
+
         all_keys = cdb.list_keys("composerData:")
         for key in all_keys:
             cid = key.split(":", 1)[1]
@@ -1535,6 +1907,40 @@ def doctor_audit() -> dict:
 
             name = cd.get("name") or ""
             msgs = len(cd.get("fullConversationHeadersOnly", []))
+
+            # Detect header ↔ composerData workspaceIdentifier drift /
+            # unnormalized vscode-remote authorities (duplicate sidebar folders).
+            h_wi = header_wi.get(cid)
+            cd_wi = cd.get("workspaceIdentifier")
+            if isinstance(h_wi, dict):
+                h_norm = _normalize_workspace_identifier(h_wi)
+                h_uri = h_wi.get("uri") if isinstance(h_wi.get("uri"), dict) else {}
+                needs_header_norm = (
+                    h_uri.get("scheme") == "vscode-remote"
+                    and json.dumps(h_norm, ensure_ascii=False, separators=(",", ":"))
+                    != json.dumps(h_wi, ensure_ascii=False, separators=(",", ":"))
+                )
+                cd_mismatch = False
+                if h_uri.get("scheme") == "vscode-remote":
+                    if not isinstance(cd_wi, dict):
+                        cd_mismatch = True
+                    elif (
+                        cd_wi.get("id") != h_norm.get("id")
+                        or _workspace_uri_fingerprint(cd_wi)
+                        != _workspace_uri_fingerprint(h_norm)
+                    ):
+                        cd_mismatch = True
+                if needs_header_norm or cd_mismatch:
+                    reason = []
+                    if needs_header_norm:
+                        reason.append("unnormalized-header-uri")
+                    if cd_mismatch:
+                        reason.append("composerData-mismatch")
+                    uri_drift.append({
+                        "composerId": cid,
+                        "name": name or "Untitled",
+                        "reason": ",".join(reason),
+                    })
 
             if cid in registered_ids:
                 registered_count += 1
@@ -1566,6 +1972,7 @@ def doctor_audit() -> dict:
         "orphaned": orphaned,
         "empty": empty_count,
         "workspaces": workspace_summaries,
+        "uri_drift": uri_drift,
     }
 
 
@@ -1803,7 +2210,9 @@ def migrate_to_global_headers(
         except Exception:
             continue
 
-        ws_identifier = _build_workspace_identifier(ws_dir)
+        ws_identifier = _normalize_workspace_identifier(
+            _build_workspace_identifier(ws_dir)
+        )
         for cid in local_ids:
             if cid in existing_ids:
                 already_present += 1
@@ -1879,6 +2288,10 @@ def migrate_to_global_headers(
         # Cursor 3.x sidebar reads the native SQL table, not only ItemTable JSON.
         for entry in final_entries:
             _upsert_native_composer_header(write_cdb, entry)
+            wi = entry.get("workspaceIdentifier")
+            cid = entry.get("composerId")
+            if cid and isinstance(wi, dict):
+                _ensure_composer_data_workspace_identifier(write_cdb, cid, wi)
         healed = _sync_native_headers_from_json(write_cdb, headers)
     finally:
         write_cdb.close()

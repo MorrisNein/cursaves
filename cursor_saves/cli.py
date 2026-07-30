@@ -22,6 +22,7 @@ from .importer import (
     import_snapshot,
     list_snapshot_projects,
     list_snapshot_files,
+    normalize_remote_uri_authorities,
     read_snapshot_meta,
     repair_missing_blobs,
 )
@@ -1596,6 +1597,15 @@ def cmd_delete(args):
 def cmd_doctor(args):
     """Audit and recover orphaned chats."""
 
+    if getattr(args, "normalize_uris", False):
+        changed, scanned = normalize_remote_uri_authorities(
+            dry_run=getattr(args, "dry_run", False),
+            force=getattr(args, "force", False),
+        )
+        if changed == 0 and scanned == 0 and not getattr(args, "force", False):
+            return
+        return
+
     audit = doctor_audit()
     storage = audit["storage"]
 
@@ -1614,6 +1624,7 @@ def cmd_doctor(args):
         f"  Registered:          {audit['registered']}\n"
         f"  Orphaned (content):  {len(audit['orphaned'])}\n"
         f"  Empty stubs:         {audit['empty']}\n"
+        f"  URI drift:           {len(audit.get('uri_drift') or [])}\n"
     )
 
     if audit["workspaces"]:
@@ -1624,9 +1635,32 @@ def cmd_doctor(args):
             print(f"  {ws['chat_count']:>3} chats   {ws['label']}")
         print()
 
+    uri_drift = audit.get("uri_drift") or []
+    if uri_drift:
+        print(
+            f"  ─── URI / composerData drift ({len(uri_drift)}) ──────────────────────\n"
+        )
+        print(
+            "  Header URI and composerData.workspaceIdentifier disagree, or\n"
+            "  vscode-remote authority/fsPath is not canonical. This splits the\n"
+            "  Agents sidebar into duplicate folder names (e.g. verme-chat-ai).\n"
+        )
+        for item in uri_drift[:12]:
+            name = item.get("name") or "Untitled"
+            if len(name) > 34:
+                name = name[:31] + "..."
+            print(f"  {item['composerId'][:8]}…  {name:<36}  {item.get('reason')}")
+        if len(uri_drift) > 12:
+            print(f"  … and {len(uri_drift) - 12} more")
+        print(
+            "\n  Fix (Cursor must be fully quit):\n"
+            "    cursaves doctor --normalize-uris\n"
+        )
+
     orphaned = audit["orphaned"]
     if not orphaned:
-        print("  No orphaned chats found.\n")
+        if not uri_drift:
+            print("  No orphaned chats found.\n")
         return
 
     print(
@@ -2010,6 +2044,14 @@ def main():
         "--force", action="store_true",
         help="Skip the Cursor-running check (use if you can't fully quit Cursor)",
     )
+    p_doctor.add_argument(
+        "--normalize-uris", action="store_true",
+        help="Normalize vscode-remote authority casing and fsPath slashes (duplicate sidebar folders)",
+    )
+    p_doctor.add_argument(
+        "--dry-run", action="store_true",
+        help="With --normalize-uris: show what would change without writing",
+    )
     p_doctor.set_defaults(func=cmd_doctor)
 
     p_migrate = subparsers.add_parser(
@@ -2070,6 +2112,7 @@ def main():
             "  status                Show synced vs local-only chats\n"
             "  doctor                Audit chats, find orphaned conversations\n"
             "  doctor --recover      Re-register orphaned chats in workspaces\n"
+            "  doctor --normalize-uris  Heal duplicate sidebar folders (URI + composerData)\n"
             "  migrate               Migrate old chats to Cursor 3.0 index\n"
             "  migrate --dry-run     Preview migration without writing\n"
             "  purge                 Delete chats from Cursor DB to free space\n"
