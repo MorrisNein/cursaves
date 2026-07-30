@@ -61,6 +61,45 @@ class SyncBackend(ABC):
 # ── Git backend ──────────────────────────────────────────────────────────
 
 
+def git_commit_env(cwd: Path | str) -> dict[str, str]:
+    """Build env for ``git commit``, with identity fallback when unset.
+
+    Many Windows installs have no ``user.name`` / ``user.email``. Without an
+    author, ``git commit`` fails — older cursaves ignored that and still
+    printed ``Pushing... done``. We never write git config; we only set
+    process env for this commit.
+    """
+    env = os.environ.copy()
+    cwd_s = str(cwd)
+
+    def _cfg(key: str) -> str:
+        r = subprocess.run(
+            ["git", "config", "--get", key],
+            cwd=cwd_s,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        return (r.stdout or "").strip() if r.returncode == 0 else ""
+
+    name = _cfg("user.name") or (env.get("GIT_AUTHOR_NAME") or "").strip()
+    email = _cfg("user.email") or (env.get("GIT_AUTHOR_EMAIL") or "").strip()
+    if name and email:
+        return env
+
+    from . import paths
+
+    host = paths.get_machine_id() or platform.node() or "local"
+    host = "".join(c if c.isalnum() or c in "-._" else "-" for c in host)[:64] or "local"
+    name = name or f"cursaves@{host}"
+    email = email or f"cursaves@{host}.invalid"
+    env["GIT_AUTHOR_NAME"] = name
+    env["GIT_AUTHOR_EMAIL"] = email
+    env["GIT_COMMITTER_NAME"] = name
+    env["GIT_COMMITTER_EMAIL"] = email
+    return env
+
+
 class GitBackend(SyncBackend):
     """Original backend: a local git repo at *sync_dir* with an optional remote."""
 
@@ -83,16 +122,22 @@ class GitBackend(SyncBackend):
             ["git", "diff", "--cached", "--quiet"],
             cwd=str(self.sync_dir), capture_output=True,
         )
-        if result.returncode == 0:
-            return True  # nothing to commit
-
-        from . import paths
-        hostname = paths.get_machine_id()
-        msg = f"[{hostname}] sync snapshots"
-        subprocess.run(
-            ["git", "commit", "-m", msg],
-            cwd=str(self.sync_dir), capture_output=True,
-        )
+        if result.returncode != 0:
+            from . import paths
+            hostname = paths.get_machine_id()
+            msg = f"[{hostname}] sync snapshots"
+            commit = subprocess.run(
+                ["git", "commit", "-m", msg],
+                cwd=str(self.sync_dir),
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                env=git_commit_env(self.sync_dir),
+            )
+            if commit.returncode != 0:
+                err = (commit.stderr or commit.stdout or "").strip() or "unknown error"
+                print(f"  Commit failed: {err}", file=sys.stderr)
+                return False
 
         if self.has_remote():
             try:

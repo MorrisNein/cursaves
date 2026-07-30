@@ -126,12 +126,15 @@ def _git_sync(repo_root: Path, project_path: str) -> tuple[bool, str]:
         # Commit
         project_name = os.path.basename(os.path.normpath(project_path))
         commit_msg = f"[{hostname}] checkpoint {project_name} ({timestamp})"
+        from .backends import git_commit_env
+
         commit_result = subprocess.run(
             ["git", "commit", "-m", commit_msg],
             capture_output=True,
             text=True,
             cwd=str(repo_root),
             timeout=10,
+            env=git_commit_env(repo_root),
         )
         if commit_result.returncode != 0:
             return False, f"git commit failed: {commit_result.stderr.strip()}"
