@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from . import __version__, db, export, paths
+from . import __version__, agent_config_sync, db, export, paths
 from .reload import print_reload_hint
 from .watch import watch_loop
 from .backends import GitBackend, S3Backend, SyncBackend, get_backend, load_config, save_config
@@ -673,6 +673,36 @@ def _find_ahead_conversations(
     return ahead_items
 
 
+def _agent_config_project_paths(items: Optional[list[dict]] = None, *extra: Optional[str]) -> list[str]:
+    """Collect unique project paths for agent-config export/import."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for p in list(extra) + [it.get("project_path") for it in (items or [])]:
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
+def _export_agent_config(project_paths: Optional[list[str]] = None) -> int:
+    return agent_config_sync.export_agent_config(project_paths)
+
+
+def _import_agent_config(project_paths: Optional[list[str]] = None) -> int:
+    return agent_config_sync.import_agent_config(project_paths)
+
+
+def _push_agent_config(backend: SyncBackend) -> bool:
+    """Stage/commit/push agent-config/ (Git). No-op when nothing to commit."""
+    if not isinstance(backend, GitBackend):
+        return True
+    agent_dir = agent_config_sync.get_agent_config_dir()
+    if not agent_dir.exists():
+        return True
+    return backend.push(paths.get_snapshots_dir(), paths=[agent_dir])
+
+
 def _export_and_push(
     sync_dir: Path,
     items: list[dict],
@@ -689,6 +719,9 @@ def _export_and_push(
         backend = get_backend()
     snapshots_dir = paths.get_snapshots_dir()
     chunk = max(1, int(chunk_size or 10))
+
+    # Agent config pack (personal + projects in this push)
+    _export_agent_config(_agent_config_project_paths(items))
 
     # Resume: push any commits left from a previous failed batch first
     if isinstance(backend, GitBackend) and backend.has_remote() and backend.has_unpushed_commits():
@@ -760,6 +793,10 @@ def _export_and_push(
             # Local-only: still commit the batch so work is not left unstaged
             if isinstance(backend, GitBackend):
                 backend.push(snapshots_dir, paths=batch_paths)
+
+    # Agent-config alone (or leftover after equal-content chat skips)
+    if isinstance(backend, GitBackend):
+        _push_agent_config(backend)
 
     return total_saved
 
@@ -1194,6 +1231,9 @@ def cmd_sync(args):
 
     # Step 2: Import — pull behind conversations from snapshots into Cursor DBs
     print("\n── Pull ──")
+    _import_agent_config(
+        [target_project_path] if target_project_path else None
+    )
     imported, pull_failure = _pull_behind(
         sync_dir,
         target_project_path=target_project_path,
@@ -1214,6 +1254,11 @@ def cmd_sync(args):
     # Step 3: Push — export ahead conversations from Cursor DBs into snapshots
     print("\n── Push ──")
     include_never = getattr(args, "all_chats", False)
+    # Agent-config even when no ahead chats (_export_and_push also exports when pushing)
+    _export_agent_config(
+        [target_project_path] if target_project_path else None
+    )
+    _push_agent_config(backend)
     pushed = _push_ahead(
         sync_dir,
         auto=True,
@@ -1250,6 +1295,8 @@ def cmd_push(args):
     if getattr(args, "ahead", False) or getattr(args, "global_sync", False):
         # If --all is also set, push ALL conversations across ALL workspaces (full global backup)
         include_never = getattr(args, "all_chats", False)
+        _export_agent_config(None)
+        _push_agent_config(backend)
         _push_ahead(
             sync_dir,
             auto=True,
@@ -1277,6 +1324,9 @@ def cmd_push(args):
         project_path, workspace_dir, source_host = result
     else:
         project_path, workspace_dir, source_host = _resolve_project_and_workspace(args)
+
+    _export_agent_config([project_path] if project_path else None)
+    _push_agent_config(backend)
 
     # Always show conversation list for selection (unless --all flag)
     if not getattr(args, "all_chats", False):
@@ -1373,6 +1423,7 @@ def cmd_pull(args):
     # If --global is set, pull behind chats for all workspaces
     if getattr(args, "global_sync", False):
         print("\n── Pull (Global) ──")
+        _import_agent_config(None)
         imported, pull_failure = _pull_behind(sync_dir, composer_ids=changed_ids)
         if imported > 0:
             print(f"  Imported {imported} conversation(s)")
@@ -1411,6 +1462,9 @@ def cmd_pull(args):
         )
         if not selected_project:
             return
+
+        # Personal agent-config always; project paths once targets are known.
+        _import_agent_config([])
 
         total_success = 0
         total_failure = 0
@@ -1463,6 +1517,7 @@ def cmd_pull(args):
                         print("  Skipped.")
                         continue
 
+                _import_agent_config([target_path])
                 for sf in selected_files:
                     print(f"  Importing {sf.name}...")
                     if import_snapshot(sf, target_path):
@@ -1472,6 +1527,7 @@ def cmd_pull(args):
                         total_failure += 1
                         print("    FAILED")
             else:
+                _import_agent_config([ws["path"] for ws in target_workspaces])
                 for ws in target_workspaces:
                     display = paths.format_workspace_display(ws)
                     print(f"  Importing into: {display}")
@@ -1503,6 +1559,8 @@ def cmd_pull(args):
             print(f"Importing into workspace: {project_path}")
         else:
             print(f"Importing snapshots for {project_path}...")
+
+        _import_agent_config([project_path] if project_path else None)
 
         success, failure = import_all_snapshots(
             project_path,

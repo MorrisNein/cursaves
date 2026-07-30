@@ -395,6 +395,8 @@ class TestChunkedPushStaging(unittest.TestCase):
                     "cursor_saves.cli.export.checkpoint_project",
                     return_value=[Path("/s/a.json.gz")],
                 ),
+                patch("cursor_saves.cli._export_agent_config", return_value=0),
+                patch("cursor_saves.cli._push_agent_config", return_value=True),
             ):
                 n = _export_and_push(
                     Path("/tmp/fake-sync"),
