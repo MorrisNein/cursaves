@@ -12,6 +12,7 @@ from .reload import print_reload_hint
 from .watch import watch_loop
 from .backends import GitBackend, S3Backend, SyncBackend, get_backend, load_config, save_config
 from .importer import (
+    collapse_duplicate_workspaces,
     copy_between_workspaces,
     doctor_audit,
     doctor_recover,
@@ -20,6 +21,7 @@ from .importer import (
     get_sync_status_for_snapshot,
     import_all_snapshots,
     import_snapshot,
+    list_collapse_groups,
     list_snapshot_projects,
     list_snapshot_files,
     normalize_remote_uri_authorities,
@@ -1594,6 +1596,125 @@ def cmd_delete(args):
         print("Synced to remote.")
 
 
+def _prompt_choice(prompt: str, n: int) -> int | None:
+    """Read a 1-based index from stdin. Returns None if cancelled/invalid."""
+    print(f"{prompt} [1-{n}, q cancels]: ", end="", flush=True)
+    try:
+        raw = input().strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if raw in ("", "q", "quit", "n", "no"):
+        return None
+    try:
+        idx = int(raw)
+    except ValueError:
+        return None
+    if 1 <= idx <= n:
+        return idx
+    return None
+
+
+def _cmd_doctor_collapse(args):
+    """Interactively (or via --target) collapse duplicate workspace hashes."""
+    groups = list_collapse_groups()
+    if not groups:
+        print("No duplicate workspace groups found (same canonical path, 2+ hashes).")
+        return
+
+    dry_run = getattr(args, "dry_run", False)
+    force = getattr(args, "force", False)
+    prune_empty = getattr(args, "prune_empty", False)
+    yes = getattr(args, "yes", False)
+    target_arg = getattr(args, "target", None)
+
+    print("\n  ─── Duplicate workspace groups ────────────────────────────────\n")
+    for i, g in enumerate(groups, 1):
+        print(f"  {i}. {g['canonical_path']}")
+        for m in g["members"]:
+            print(f"       {m['label']}")
+        print()
+
+    # Non-interactive: --target HASH
+    if target_arg:
+        if not yes and not dry_run:
+            print(
+                f"Collapse onto {target_arg!r}. Continue? [y/N]: ",
+                end="",
+                flush=True,
+            )
+            try:
+                ans = input().strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            if ans not in ("y", "yes"):
+                print("Cancelled.")
+                return
+        collapse_duplicate_workspaces(
+            target_hash=target_arg,
+            dry_run=dry_run,
+            force=force,
+            prune_empty=prune_empty,
+        )
+        return
+
+    # dry-run without --target: show plan options, no TUI dependency
+    if dry_run:
+        print("Pick a canonical hash with --target, e.g.:\n")
+        for g in groups:
+            # Suggest the member with the most chats
+            best = max(g["members"], key=lambda m: m["chat_count"])
+            print(
+                f"  python -m cursor_saves doctor --collapse --dry-run "
+                f"--target {best['hash']}"
+            )
+            print(f"    # {g['canonical_path']} → {best['label']}")
+            print()
+        return
+
+    # Interactive (plain stdin — works without InquirerPy / uv tool env)
+    g_idx = _prompt_choice("Select project group", len(groups))
+    if g_idx is None:
+        print("Cancelled.")
+        return
+    group = groups[g_idx - 1]
+
+    print(f"\n  Canonical workspace for {group['canonical_path']}:\n")
+    for i, m in enumerate(group["members"], 1):
+        print(f"  {i}. {m['label']}")
+    print()
+    t_idx = _prompt_choice("Choose CANONICAL workspace (others move onto it)", len(group["members"]))
+    if t_idx is None:
+        print("Cancelled.")
+        return
+    target_hash = group["members"][t_idx - 1]["hash"]
+
+    print(f"\n  Canonical: {target_hash[:8]}…")
+    for m in group["members"]:
+        if m["hash"] == target_hash:
+            continue
+        print(f"  Will move/prune: {m['label']}")
+
+    if not yes:
+        print("\nApply collapse? Cursor must be fully quit. [y/N]: ", end="", flush=True)
+        try:
+            ans = input().strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if ans not in ("y", "yes"):
+            print("Cancelled.")
+            return
+
+    collapse_duplicate_workspaces(
+        target_hash=target_hash,
+        dry_run=False,
+        force=force,
+        prune_empty=prune_empty,
+    )
+
+
 def cmd_doctor(args):
     """Audit and recover orphaned chats."""
 
@@ -1604,6 +1725,10 @@ def cmd_doctor(args):
         )
         if changed == 0 and scanned == 0 and not getattr(args, "force", False):
             return
+        return
+
+    if getattr(args, "collapse", False):
+        _cmd_doctor_collapse(args)
         return
 
     audit = doctor_audit()
@@ -2049,8 +2174,25 @@ def main():
         help="Normalize vscode-remote authority casing and fsPath slashes (duplicate sidebar folders)",
     )
     p_doctor.add_argument(
+        "--collapse", action="store_true",
+        help="Collapse duplicate workspace hashes for the same project path onto a chosen canonical hash",
+    )
+    p_doctor.add_argument(
+        "--target",
+        help="With --collapse: canonical workspace hash (or unique prefix). "
+             "May be remote WSL or file:// — you choose.",
+    )
+    p_doctor.add_argument(
+        "--prune-empty", action="store_true",
+        help="With --collapse: delete emptied workspaceStorage folders after move",
+    )
+    p_doctor.add_argument(
+        "--yes", "-y", action="store_true",
+        help="With --collapse: skip confirmation prompts",
+    )
+    p_doctor.add_argument(
         "--dry-run", action="store_true",
-        help="With --normalize-uris: show what would change without writing",
+        help="With --normalize-uris/--collapse: show what would change without writing",
     )
     p_doctor.set_defaults(func=cmd_doctor)
 
@@ -2113,6 +2255,8 @@ def main():
             "  doctor                Audit chats, find orphaned conversations\n"
             "  doctor --recover      Re-register orphaned chats in workspaces\n"
             "  doctor --normalize-uris  Heal duplicate sidebar folders (URI + composerData)\n"
+            "  doctor --collapse        Merge duplicate workspace hashes (you pick canonical)\n"
+            "  doctor --collapse --target ab1af614 --dry-run\n"
             "  migrate               Migrate old chats to Cursor 3.0 index\n"
             "  migrate --dry-run     Preview migration without writing\n"
             "  purge                 Delete chats from Cursor DB to free space\n"
