@@ -1484,6 +1484,349 @@ def _sync_composer_data_workspace_identifiers(
     return changed, scanned
 
 
+def list_collapse_groups() -> list[dict]:
+    """Group workspaceStorage folders that share a canonical project path.
+
+    Each group dict:
+      canonical_path, members: [{
+        hash, workspace_dir, folder_uri, path, type, host, chat_count, chat_ids
+      }]
+    Only returns groups with 2+ members.
+    """
+    global_db_path = paths.get_global_db_path()
+    chats_by_ws: dict[str, list[str]] = {}
+    if global_db_path.exists():
+        with db.CursorDB(global_db_path) as cdb:
+            for entry in cdb.list_native_composer_headers():
+                cid = entry.get("composerId")
+                wi = entry.get("workspaceIdentifier") or {}
+                wid = wi.get("id") if isinstance(wi, dict) else None
+                if not cid or not wid:
+                    continue
+                chats_by_ws.setdefault(wid, []).append(cid)
+
+    by_canon: dict[str, list[dict]] = {}
+    for ws in paths.list_all_workspaces():
+        folder_uri = ws.get("folder_uri") or ""
+        canon = paths.canonicalize_project_path(folder_uri or ws.get("path") or "")
+        if not canon:
+            continue
+        ws_hash = ws["workspace_dir"].name
+        chat_ids = list(chats_by_ws.get(ws_hash, []))
+        member = {
+            "hash": ws_hash,
+            "workspace_dir": ws["workspace_dir"],
+            "folder_uri": folder_uri,
+            "path": ws.get("path") or "",
+            "type": ws.get("type") or "local",
+            "host": ws.get("host"),
+            "chat_count": len(chat_ids),
+            "chat_ids": chat_ids,
+            "label": _collapse_member_label(
+                ws_hash, ws.get("type"), ws.get("host"), folder_uri, len(chat_ids)
+            ),
+        }
+        by_canon.setdefault(canon, []).append(member)
+
+    groups = []
+    for canon, members in sorted(by_canon.items(), key=lambda x: x[0]):
+        if len(members) < 2:
+            continue
+        members.sort(key=lambda m: (-m["chat_count"], m["type"] != "ssh", m["hash"]))
+        groups.append({"canonical_path": canon, "members": members})
+    return groups
+
+
+def _collapse_member_label(
+    ws_hash: str,
+    ws_type: Optional[str],
+    host: Optional[str],
+    folder_uri: str,
+    chat_count: int,
+) -> str:
+    short_uri = folder_uri
+    if len(short_uri) > 72:
+        short_uri = short_uri[:69] + "..."
+    host_bit = f" host={host}" if host else ""
+    return (
+        f"{ws_hash[:8]}  {ws_type or '?':9}{host_bit}  "
+        f"{chat_count} chats  {short_uri}"
+    )
+
+
+def _set_workspace_composer_membership(
+    ws_dir: Path,
+    composer_id: str,
+    *,
+    present: bool,
+) -> None:
+    """Add or remove composerId from a workspace's local composer.composerData lists."""
+    ws_db_path = ws_dir / "state.vscdb"
+    if not ws_db_path.exists():
+        return
+    ws_cdb = db.CursorDB(ws_db_path)
+    try:
+        existing = ws_cdb.get_json("composer.composerData", table="ItemTable")
+        if existing is None:
+            if not present:
+                return
+            existing = {"selectedComposerIds": []}
+        else:
+            existing = dict(existing)
+
+        def _list_field(key: str) -> list:
+            val = existing.get(key)
+            return list(val) if isinstance(val, list) else []
+
+        selected = _list_field("selectedComposerIds")
+        focused = _list_field("lastFocusedComposerIds")
+        all_composers = _list_field("allComposers")
+
+        if present:
+            if composer_id not in selected:
+                selected.append(composer_id)
+            if focused and composer_id not in focused:
+                focused.append(composer_id)
+        else:
+            selected = [c for c in selected if c != composer_id]
+            focused = [c for c in focused if c != composer_id]
+            all_composers = [
+                c
+                for c in all_composers
+                if not (isinstance(c, dict) and c.get("composerId") == composer_id)
+            ]
+
+        existing["selectedComposerIds"] = selected
+        if "lastFocusedComposerIds" in existing or focused:
+            existing["lastFocusedComposerIds"] = focused
+        if "allComposers" in existing:
+            existing["allComposers"] = all_composers
+        ws_cdb.write_json("composer.composerData", existing, table="ItemTable")
+    finally:
+        ws_cdb.close()
+
+
+def collapse_duplicate_workspaces(
+    target_hash: str,
+    source_hashes: Optional[list[str]] = None,
+    dry_run: bool = False,
+    force: bool = False,
+    prune_empty: bool = False,
+) -> dict:
+    """Move chats from duplicate workspace hashes onto a chosen canonical hash.
+
+    ``target_hash`` is the workspaceStorage folder name the user chose
+    (remote WSL, file://wsl.localhost, etc.). Other members of the same
+    canonical project path are sources unless ``source_hashes`` is set.
+
+    Returns stats dict: moved, sources, pruned, scanned, canonical_path.
+    """
+    import shutil
+
+    stats = {
+        "moved": 0,
+        "sources": 0,
+        "pruned": 0,
+        "scanned": 0,
+        "canonical_path": "",
+        "target_hash": target_hash,
+    }
+
+    if not dry_run and not force and is_cursor_running():
+        print(
+            "WARNING: Cursor is running. Close Cursor FIRST,\n"
+            "then run this command, then reopen Cursor.\n"
+            "Use --force to override (not recommended).\n",
+            file=sys.stderr,
+        )
+        return stats
+
+    groups = list_collapse_groups()
+    group = None
+    for g in groups:
+        hashes = {m["hash"] for m in g["members"]}
+        if target_hash in hashes or any(m["hash"].startswith(target_hash) for m in g["members"]):
+            # Allow short prefix match unique within group
+            matches = [m for m in g["members"] if m["hash"] == target_hash or m["hash"].startswith(target_hash)]
+            if len(matches) == 1:
+                target_hash = matches[0]["hash"]
+                group = g
+                break
+            if any(m["hash"] == target_hash for m in g["members"]):
+                group = g
+                break
+    if group is None:
+        print(f"No collapse group contains workspace hash {target_hash!r}.", file=sys.stderr)
+        print("Run: cursaves doctor --collapse --dry-run", file=sys.stderr)
+        return stats
+
+    stats["canonical_path"] = group["canonical_path"]
+    members_by_hash = {m["hash"]: m for m in group["members"]}
+    target = members_by_hash.get(target_hash)
+    if not target:
+        print(f"Target hash {target_hash!r} not in group.", file=sys.stderr)
+        return stats
+
+    if source_hashes is None:
+        sources = [m for m in group["members"] if m["hash"] != target_hash]
+    else:
+        resolved = []
+        for sh in source_hashes:
+            hits = [m for m in group["members"] if m["hash"] == sh or m["hash"].startswith(sh)]
+            if len(hits) != 1:
+                print(f"Ambiguous or unknown source hash {sh!r}.", file=sys.stderr)
+                return stats
+            if hits[0]["hash"] == target_hash:
+                continue
+            resolved.append(hits[0])
+        sources = resolved
+
+    target_wi = _normalize_workspace_identifier(
+        _build_workspace_identifier(target["workspace_dir"])
+    )
+    # Ensure id is the storage hash Cursor indexes by
+    target_wi = dict(target_wi)
+    target_wi["id"] = target_hash
+
+    print(f"\nCollapse → {group['canonical_path']}")
+    print(f"  target  {target['label']}")
+    for src in sources:
+        action = "move" if src["chat_count"] else "prune" if prune_empty else "skip "
+        print(f"  {action}  {src['label']}")
+
+    to_move: list[tuple[str, dict]] = []  # (cid, source_member)
+    for src in sources:
+        for cid in src["chat_ids"]:
+            to_move.append((cid, src))
+    stats["scanned"] = len(to_move)
+    stats["sources"] = len(sources)
+
+    if dry_run:
+        print(f"\nWould move {len(to_move)} chat(s) onto {target_hash[:8]}.")
+        if prune_empty:
+            empty = [s for s in sources if s["chat_count"] == 0]
+            print(f"Would prune {len(empty)} empty workspaceStorage folder(s).")
+        return stats
+
+    global_db_path = paths.get_global_db_path()
+    if not global_db_path.exists():
+        print("Global DB not found.", file=sys.stderr)
+        return stats
+
+    backup_path = db.backup_db(global_db_path)
+    print(f"\nBacked up global DB to {backup_path.name}")
+
+    write_cdb = db.CursorDB(global_db_path)
+    try:
+        headers = write_cdb.get_json("composer.composerHeaders", table="ItemTable")
+        if headers is None or not isinstance(headers, dict):
+            headers = {"allComposers": []}
+        all_composers = headers.get("allComposers", [])
+        if not isinstance(all_composers, list):
+            all_composers = []
+        json_by_id = {
+            e.get("composerId"): i
+            for i, e in enumerate(all_composers)
+            if isinstance(e, dict) and e.get("composerId")
+        }
+
+        for cid, src in to_move:
+            # Prefer SQL row as source of truth for header fields
+            entry = None
+            if _native_composer_headers_exists(write_cdb):
+                conn = write_cdb._get_write_conn()
+                row = conn.execute(
+                    "SELECT value FROM composerHeaders WHERE composerId=?",
+                    (cid,),
+                ).fetchone()
+                if row and row[0]:
+                    try:
+                        val = row[0]
+                        if isinstance(val, bytes):
+                            val = val.decode("utf-8", errors="replace")
+                        parsed = json.loads(val)
+                        if isinstance(parsed, dict):
+                            entry = parsed
+                    except (json.JSONDecodeError, TypeError):
+                        entry = None
+            if entry is None:
+                idx = json_by_id.get(cid)
+                if idx is not None:
+                    entry = dict(all_composers[idx])
+            if entry is None:
+                cd = write_cdb.get_json(f"composerData:{cid}")
+                if not isinstance(cd, dict):
+                    print(f"  Skip {cid[:8]}… (no header/composerData)")
+                    continue
+                entry = _build_composer_header_entry(cid, cd)
+
+            entry = dict(entry)
+            entry["composerId"] = cid
+            entry["workspaceIdentifier"] = target_wi
+            _upsert_native_composer_header(write_cdb, entry)
+
+            if cid in json_by_id:
+                all_composers[json_by_id[cid]] = entry
+            else:
+                json_by_id[cid] = len(all_composers)
+                all_composers.append(entry)
+
+            _ensure_composer_data_workspace_identifier(write_cdb, cid, target_wi)
+
+            _set_workspace_composer_membership(
+                src["workspace_dir"], cid, present=False
+            )
+            _set_workspace_composer_membership(
+                target["workspace_dir"], cid, present=True
+            )
+
+            name = entry.get("name") or "(unnamed)"
+            print(
+                f"  Moved {cid[:8]}… \"{str(name)[:40]}\"  "
+                f"{src['hash'][:8]} → {target_hash[:8]}"
+            )
+            stats["moved"] += 1
+
+        headers["allComposers"] = all_composers
+        write_cdb.write_json("composer.composerHeaders", headers, table="ItemTable")
+    finally:
+        write_cdb.close()
+
+    paths.invalidate_headers_cache()
+
+    if prune_empty:
+        # Re-count chats on sources after move
+        remaining: dict[str, int] = {s["hash"]: 0 for s in sources}
+        with db.CursorDB(global_db_path) as cdb:
+            for entry in cdb.list_native_composer_headers():
+                wi = entry.get("workspaceIdentifier") or {}
+                wid = wi.get("id") if isinstance(wi, dict) else None
+                if wid in remaining:
+                    remaining[wid] += 1
+        for src in sources:
+            if remaining.get(src["hash"], 0) > 0:
+                continue
+            ws_dir = src["workspace_dir"]
+            if not ws_dir.is_dir():
+                continue
+            # Safety: only delete under workspaceStorage, hash-like name
+            if ws_dir.parent != paths.get_workspace_storage_dir():
+                continue
+            if len(src["hash"]) < 16:
+                continue
+            print(f"  Pruned empty workspaceStorage/{src['hash'][:8]}…")
+            shutil.rmtree(ws_dir, ignore_errors=True)
+            stats["pruned"] += 1
+
+    print(
+        f"\nMoved {stats['moved']} chat(s) onto {target_hash[:8]} "
+        f"({stats['canonical_path']})."
+    )
+    if stats["moved"] or stats["pruned"]:
+        print("Restart Cursor to refresh the sidebar.")
+    return stats
+
+
 def _register_in_workspace(
     composer_id: str,
     composer_data: dict,
