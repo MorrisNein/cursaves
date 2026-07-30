@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import db, paths
+from . import plans as plan_sync
 
 
 def get_workspace_conversations(
@@ -470,6 +471,11 @@ def export_conversation(
         # agent loop fails with "Blob not found" when continuing the chat.
         agent_blobs = _extract_agent_blobs(conv_data, _cdb)
 
+        # Plan-mode .plan.md bodies linked via composer.planRegistry
+        linked_plans = plan_sync.collect_plans_for_composer(composer_id, _cdb)
+        if linked_plans:
+            print(f"  Including {len(linked_plans)} plan file(s)")
+
         snapshot = {
             "version": 3,
             "exportedAt": datetime.now(timezone.utc).isoformat(),
@@ -485,6 +491,7 @@ def export_conversation(
             "agentBlobs": agent_blobs,
             "transcript": get_transcript(project_path, composer_id),
             "messageContexts": contexts,
+            "plans": linked_plans,
         }
 
         return snapshot
@@ -585,6 +592,7 @@ def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
         "projectIdentifier": snapshot.get("projectIdentifier"),
         "version": snapshot.get("version"),
         "shardCount": num_shards if num_shards else None,
+        "planCount": len(snapshot.get("plans") or []) or None,
     }
     meta_file = project_dir / f"{composer_id}.meta.json"
     meta_file.write_text(json.dumps(meta, indent=2))

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import db, paths
+from . import plans as plan_sync
 
 
 def _get_shard_paths(base_path: Path) -> list[Path]:
@@ -263,6 +264,40 @@ def find_or_create_workspace(project_path: str) -> Path:
     return ws_dir
 
 
+def _maybe_restore_plans(
+    snapshot: dict,
+    composer_id: str,
+    target_project_path: str,
+    target_workspace_dir: Optional[Path],
+) -> None:
+    """Best-effort plan restore (also used when chat body itself is skipped)."""
+    snap_plans = snapshot.get("plans") or []
+    if not snap_plans:
+        return
+    target_path = os.path.normpath(target_project_path)
+    if target_workspace_dir is not None:
+        ws_dir = target_workspace_dir
+    else:
+        matches = paths.find_all_matching_workspaces(target_path)
+        if matches:
+            ws_dir = matches[0]["workspace_dir"]
+        else:
+            print("  Plan heal skipped: no matching workspace", file=sys.stderr)
+            return
+    global_db_path = paths.get_global_db_path()
+    if not global_db_path.exists():
+        return
+    plan_cdb = db.CursorDB(global_db_path)
+    try:
+        n_plans = plan_sync.restore_plans_for_composer(
+            snap_plans, composer_id, target_path, ws_dir, plan_cdb
+        )
+        if n_plans:
+            print(f"  Restored {n_plans} plan file(s)")
+    finally:
+        plan_cdb.close()
+
+
 def _init_workspace_db(db_path: Path):
     """Create a minimal state.vscdb with the required tables."""
     import sqlite3
@@ -375,6 +410,8 @@ def import_snapshot(
     headers = composer_data.get("fullConversationHeadersOnly", [])
     if not headers and not composer_data.get("name"):
         print(f"  Skipping empty conversation {composer_id[:12]}...")
+        # Still heal linked plans if the snapshot carries them
+        _maybe_restore_plans(snapshot, composer_id, target_path, target_workspace_dir)
         return True  # Not an error, just nothing to import
 
     # Rewrite paths if the project is at a different location
@@ -409,10 +446,13 @@ def import_snapshot(
             f"  Skipped: \"{chat_name}\" — local has {local_count} msgs, "
             f"snapshot has {snap_count} (local is newer, nothing to import)"
         )
+        # Still heal missing plan files for plan-mode chats
+        _maybe_restore_plans(snapshot, composer_id, target_path, target_workspace_dir)
         return True
 
     if conflict == "identical":
         print(f"  Skipped: \"{chat_name}\" — already up to date ({len(headers)} msgs)")
+        _maybe_restore_plans(snapshot, composer_id, target_path, target_workspace_dir)
         return True
 
     if conflict == "new":
@@ -525,6 +565,23 @@ def import_snapshot(
         print(f"  Backed up workspace DB to {backup_path.name}")
 
     _register_in_workspace(composer_id, composer_data, ws_dir)
+
+    # ── Step 3b: Restore linked Plan-mode .plan.md files ─────────────
+    snap_plans = snapshot.get("plans") or []
+    if snap_plans:
+        plan_cdb = db.CursorDB(global_db_path)
+        try:
+            n_plans = plan_sync.restore_plans_for_composer(
+                snap_plans,
+                composer_id,
+                target_path,
+                ws_dir,
+                plan_cdb,
+            )
+            if n_plans:
+                print(f"  Restored {n_plans} plan file(s)")
+        finally:
+            plan_cdb.close()
 
     # ── Step 4: Verify writes ─────────────────────────────────────────
     verify_cdb = db.CursorDB(global_db_path)
