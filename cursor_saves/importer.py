@@ -866,27 +866,172 @@ def import_all_snapshots(
 def _build_composer_header_entry(composer_id: str, composer_data: dict) -> dict:
     """Build a composer header entry suitable for both allComposers and
     composer.composerHeaders."""
+    created = composer_data.get("createdAt", 0) or 0
+    updated = composer_data.get("lastUpdatedAt", created) or created
     return {
-        "type": "head",
+        "type": composer_data.get("type") or "head",
         "composerId": composer_id,
-        "lastUpdatedAt": composer_data.get("lastUpdatedAt", composer_data.get("createdAt", 0)),
-        "createdAt": composer_data.get("createdAt", 0),
+        "lastUpdatedAt": updated,
+        "createdAt": created,
         "unifiedMode": composer_data.get("unifiedMode", "agent"),
-        "forceMode": composer_data.get("forceMode", ""),
+        "forceMode": composer_data.get("forceMode") or "edit",
         "hasUnreadMessages": False,
         "totalLinesAdded": composer_data.get("totalLinesAdded", 0),
         "totalLinesRemoved": composer_data.get("totalLinesRemoved", 0),
         "filesChangedCount": composer_data.get("filesChangedCount", 0),
         "subtitle": composer_data.get("subtitle", ""),
-        "isArchived": False,
-        "isDraft": False,
-        "isWorktree": False,
+        "hasBlockingPendingActions": False,
+        "hasPendingPlan": False,
+        "isArchived": bool(composer_data.get("isArchived") or False),
+        "isDraft": bool(composer_data.get("isDraft") or False),
+        "isWorktree": bool(composer_data.get("isWorktree") or False),
+        "worktreeStartedReadOnly": False,
         "isSpec": False,
-        "isBestOfNSubcomposer": False,
+        "isProject": False,
+        "isBestOfNSubcomposer": bool(
+            composer_data.get("isBestOfNSubcomposer") or False
+        ),
         "numSubComposers": len(composer_data.get("subComposerIds", [])),
         "referencedPlans": [],
+        "trackedGitRepos": [],
         "name": composer_data.get("name", "Imported conversation"),
     }
+
+
+def _native_composer_headers_exists(global_cdb: "db.CursorDB") -> bool:
+    """Return True if Cursor's native composerHeaders SQL table exists."""
+    try:
+        conn = global_cdb._get_write_conn()
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='composerHeaders'"
+        ).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+
+def _upsert_native_composer_header(
+    global_cdb: "db.CursorDB",
+    entry: dict,
+    composer_data: Optional[dict] = None,
+) -> bool:
+    """Upsert a chat into Cursor 3.x's native composerHeaders SQL table.
+
+    Cursor's sidebar reads this table. Writing only ItemTable
+    composer.composerHeaders JSON is not enough for imported chats to appear.
+
+    Returns True if a row was written, False if the table is absent/unusable.
+    """
+    if not _native_composer_headers_exists(global_cdb):
+        return False
+
+    composer_id = entry.get("composerId")
+    if not composer_id:
+        return False
+
+    wi = entry.get("workspaceIdentifier") or {}
+    workspace_id = wi.get("id") or ""
+    if not workspace_id:
+        return False
+
+    cd = composer_data or {}
+    created = int(entry.get("createdAt") or cd.get("createdAt") or 0)
+    updated_raw = entry.get("lastUpdatedAt", cd.get("lastUpdatedAt"))
+    updated = int(updated_raw) if updated_raw not in (None, "") else None
+    recency = int(updated or created or 0)
+    checkpoint_raw = cd.get("conversationCheckpointLastUpdatedAt")
+    checkpoint = int(checkpoint_raw) if checkpoint_raw not in (None, "") else None
+    is_archived = 1 if entry.get("isArchived") or cd.get("isArchived") else 0
+    is_subagent = 1 if (
+        entry.get("isBestOfNSubcomposer")
+        or cd.get("isBestOfNSubcomposer")
+        or cd.get("isSubagent")
+    ) else 0
+
+    # Ensure workspaceIdentifier is embedded in the JSON value Cursor stores.
+    value_obj = dict(entry)
+    value_obj["workspaceIdentifier"] = wi
+    value_json = json.dumps(value_obj, separators=(",", ":"), ensure_ascii=False)
+
+    conn = global_cdb._get_write_conn()
+    conn.execute(
+        """
+        INSERT INTO composerHeaders (
+            composerId, workspaceId, createdAt, lastUpdatedAt,
+            isArchived, isSubagent, recency, checkpointAt, value
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(composerId) DO UPDATE SET
+            workspaceId=excluded.workspaceId,
+            createdAt=excluded.createdAt,
+            lastUpdatedAt=excluded.lastUpdatedAt,
+            isArchived=excluded.isArchived,
+            isSubagent=excluded.isSubagent,
+            recency=excluded.recency,
+            checkpointAt=excluded.checkpointAt,
+            value=excluded.value
+        """,
+        (
+            composer_id,
+            workspace_id,
+            created,
+            updated,
+            is_archived,
+            is_subagent,
+            recency,
+            checkpoint,
+            value_json,
+        ),
+    )
+    if not global_cdb._in_transaction:
+        conn.commit()
+    return True
+
+
+def _delete_native_composer_headers(
+    global_cdb: "db.CursorDB",
+    composer_ids: set[str],
+) -> int:
+    """Delete rows from the native composerHeaders table. Returns rows deleted."""
+    if not composer_ids or not _native_composer_headers_exists(global_cdb):
+        return 0
+    conn = global_cdb._get_write_conn()
+    placeholders = ",".join("?" for _ in composer_ids)
+    cur = conn.execute(
+        f"DELETE FROM composerHeaders WHERE composerId IN ({placeholders})",
+        tuple(composer_ids),
+    )
+    if not global_cdb._in_transaction:
+        conn.commit()
+    return cur.rowcount if cur.rowcount is not None else 0
+
+
+def _sync_native_headers_from_json(
+    global_cdb: "db.CursorDB",
+    headers: dict,
+) -> int:
+    """Upsert ItemTable composer.composerHeaders entries missing from SQL.
+
+    Returns the number of native rows written. No-op if the SQL table is absent.
+    """
+    if not _native_composer_headers_exists(global_cdb):
+        return 0
+
+    conn = global_cdb._get_write_conn()
+    existing = {
+        row[0]
+        for row in conn.execute("SELECT composerId FROM composerHeaders")
+    }
+    written = 0
+    for entry in headers.get("allComposers", []):
+        cid = entry.get("composerId")
+        if not cid or cid in existing:
+            continue
+        if not (entry.get("workspaceIdentifier") or {}).get("id"):
+            continue
+        if _upsert_native_composer_header(global_cdb, entry):
+            written += 1
+            existing.add(cid)
+    return written
 
 
 def _build_workspace_identifier(ws_dir: Path) -> dict:
@@ -924,10 +1069,12 @@ def _build_workspace_identifier(ws_dir: Path) -> dict:
         uri_obj["external"] = folder_uri
         uri_obj["scheme"] = "file"
     elif folder_uri.startswith("vscode-remote://"):
+        from urllib.parse import unquote
         parts = folder_uri.split("/", 3)
-        authority = parts[2] if len(parts) > 2 else ""
+        authority = unquote(parts[2]) if len(parts) > 2 else ""
         fs_path = "/" + parts[3] if len(parts) > 3 else "/"
         uri_obj["fsPath"] = fs_path
+        uri_obj["_sep"] = 1
         uri_obj["path"] = fs_path
         uri_obj["external"] = folder_uri
         uri_obj["scheme"] = "vscode-remote"
@@ -943,10 +1090,13 @@ def _register_in_global_headers(
     composer_data: dict,
     ws_dir: Path,
 ) -> None:
-    """Register a conversation in the global composer.composerHeaders index.
+    """Register a conversation in Cursor's global chat indexes.
 
-    This is the Cursor 3.0+ central index that maps chats to workspaces.
-    Safe to call on any Cursor version — creates the index if absent.
+    Writes both:
+      1. Legacy ItemTable JSON key composer.composerHeaders (cursaves / older Cursor)
+      2. Native composerHeaders SQL table (Cursor 3.x sidebar)
+
+    Upserts on re-register so workspace moves update both indexes.
     """
     global_db_path = paths.get_global_db_path()
     global_cdb = db.CursorDB(global_db_path)
@@ -956,15 +1106,22 @@ def _register_in_global_headers(
             headers = {"allComposers": []}
 
         all_composers = headers.get("allComposers", [])
-        existing_ids = {c.get("composerId") for c in all_composers}
+        entry = _build_composer_header_entry(composer_id, composer_data)
+        entry["workspaceIdentifier"] = _build_workspace_identifier(ws_dir)
 
-        if composer_id not in existing_ids:
-            entry = _build_composer_header_entry(composer_id, composer_data)
-            entry["workspaceIdentifier"] = _build_workspace_identifier(ws_dir)
+        replaced = False
+        for i, existing in enumerate(all_composers):
+            if existing.get("composerId") == composer_id:
+                all_composers[i] = entry
+                replaced = True
+                break
+        if not replaced:
             all_composers.append(entry)
-            headers["allComposers"] = all_composers
-            global_cdb.write_json("composer.composerHeaders", headers, table="ItemTable")
-            paths.invalidate_headers_cache()
+
+        headers["allComposers"] = all_composers
+        global_cdb.write_json("composer.composerHeaders", headers, table="ItemTable")
+        _upsert_native_composer_header(global_cdb, entry, composer_data)
+        paths.invalidate_headers_cache()
     finally:
         global_cdb.close()
 
@@ -1018,9 +1175,9 @@ def _register_in_workspace(
 
         ws_cdb.write_json("composer.composerData", existing, table="ItemTable")
 
-        # Cursor 3.0+: register in the global headers index
-        if is_migrated:
-            _register_in_global_headers(composer_id, composer_data, ws_dir)
+        # Keep Cursor's global indexes updated (ItemTable JSON + native SQL table).
+        # Required for imported chats to appear in the Cursor 3.x sidebar.
+        _register_in_global_headers(composer_id, composer_data, ws_dir)
 
         return True
     finally:
@@ -1645,6 +1802,21 @@ def migrate_to_global_headers(
             existing_ids.add(cid)
 
     if not to_migrate:
+        # JSON index may be complete while Cursor 3.x SQL table is not —
+        # backfill native rows so already-imported chats become visible.
+        if not dry_run:
+            write_cdb = db.CursorDB(global_db_path)
+            try:
+                healed = _sync_native_headers_from_json(write_cdb, headers)
+            finally:
+                write_cdb.close()
+            if healed:
+                print(
+                    f"All chats already in JSON index ({already_present} checked); "
+                    f"backfilled {healed} into native composerHeaders."
+                )
+                print("Restart Cursor to see them in the sidebar.")
+                return healed, already_present
         print(f"All chats already in global index ({already_present} checked).")
         return 0, already_present
 
@@ -1689,11 +1861,17 @@ def migrate_to_global_headers(
     write_cdb = db.CursorDB(global_db_path)
     try:
         write_cdb.write_json("composer.composerHeaders", headers, table="ItemTable")
+        # Cursor 3.x sidebar reads the native SQL table, not only ItemTable JSON.
+        for entry in final_entries:
+            _upsert_native_composer_header(write_cdb, entry)
+        healed = _sync_native_headers_from_json(write_cdb, headers)
     finally:
         write_cdb.close()
     paths.invalidate_headers_cache()
 
     print(f"Migrated {len(final_entries)} chat(s) to global index.")
+    if healed:
+        print(f"Also backfilled {healed} existing chat(s) into native composerHeaders.")
     print("Restart Cursor to see them in the sidebar.")
     return len(final_entries), already_present
 
@@ -1803,7 +1981,8 @@ def purge_chats(
 
     Removes from the global DB: composerData, bubbleId, checkpointId,
     and messageRequestContext entries. Also removes from
-    composer.composerHeaders (3.0+) and workspace allComposers (2.x).
+    composer.composerHeaders (ItemTable JSON), the native composerHeaders
+    SQL table (Cursor 3.x), and workspace allComposers (2.x).
 
     Args:
         composer_ids: List of composer IDs to delete.
@@ -1856,6 +2035,9 @@ def purge_chats(
                 write_cdb.write_json(
                     "composer.composerHeaders", headers, table="ItemTable"
                 )
+
+        # Keep Cursor 3.x sidebar index in sync
+        _delete_native_composer_headers(write_cdb, cid_set)
     finally:
         write_cdb.close()
 
