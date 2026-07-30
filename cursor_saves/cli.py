@@ -61,7 +61,13 @@ def _ensure_synced() -> None:
         backend = get_backend()
         snapshots_dir = paths.get_snapshots_dir()
         if backend.has_remote():
-            backend.pull(snapshots_dir)
+            tip = _load_sync_state().get("lastSuccessfulRemoteTip")
+            if isinstance(backend, GitBackend):
+                if backend.pull(snapshots_dir, previous_tip=tip):
+                    if backend.last_pull_tip:
+                        _mark_pull_tip(backend.last_pull_tip)
+            else:
+                backend.pull(snapshots_dir)
 
 
 def _resolve_project(args) -> str:
@@ -665,46 +671,132 @@ def _find_ahead_conversations(
     return ahead_items
 
 
-def _export_and_push(sync_dir: Path, items: list[dict], backend: Optional[SyncBackend] = None) -> int:
-    """Export a list of ahead conversation items and push via the backend.
+def _export_and_push(
+    sync_dir: Path,
+    items: list[dict],
+    backend: Optional[SyncBackend] = None,
+    chunk_size: int = 10,
+) -> int:
+    """Export conversation items in chunks and push each batch.
 
     Returns the number of conversations successfully exported.
     """
     from collections import defaultdict
+
+    if backend is None:
+        backend = get_backend()
+    snapshots_dir = paths.get_snapshots_dir()
+    chunk = max(1, int(chunk_size or 10))
+
+    # Resume: push any commits left from a previous failed batch first
+    if isinstance(backend, GitBackend) and backend.has_remote() and backend.has_unpushed_commits():
+        print("  Pushing pending local commit(s)...", end="", flush=True)
+        if backend._push_origin_only():
+            print(" done")
+        else:
+            print(" failed", file=sys.stderr)
+            return 0
 
     by_workspace: dict[tuple, list[dict]] = defaultdict(list)
     for item in items:
         key = (item["project_path"], str(item["workspace_dir"]))
         by_workspace[key].append(item)
 
+    # Flatten to a stable list for chunking across workspaces
+    ordered: list[dict] = []
+    for ws_items in by_workspace.values():
+        ordered.extend(ws_items)
+
     total_saved = 0
-    for (project_path, ws_dir_str), ws_items in by_workspace.items():
-        ws_dir = Path(ws_dir_str)
-        host = ws_items[0].get("host")
-        composer_ids = [it["composerId"] for it in ws_items]
-        saved = export.checkpoint_project(
-            project_path,
-            composer_ids=composer_ids,
-            workspace_dir=ws_dir,
-            source_host=host or None,
+    total_batches = (len(ordered) + chunk - 1) // chunk if ordered else 0
+
+    for batch_idx in range(0, len(ordered), chunk):
+        batch = ordered[batch_idx : batch_idx + chunk]
+        batch_num = batch_idx // chunk + 1
+        print(
+            f"  [batch {batch_num}/{total_batches}] "
+            f"exporting {len(batch)} conversation(s)..."
         )
-        total_saved += len(saved)
 
-    if total_saved == 0:
-        return 0
+        batch_paths: list[Path] = []
+        # Group this batch by workspace for checkpoint_project
+        batch_by_ws: dict[tuple, list[dict]] = defaultdict(list)
+        for item in batch:
+            key = (item["project_path"], str(item["workspace_dir"]))
+            batch_by_ws[key].append(item)
 
-    if backend is None:
-        backend = get_backend()
+        for (project_path, ws_dir_str), ws_items in batch_by_ws.items():
+            ws_dir = Path(ws_dir_str)
+            host = ws_items[0].get("host")
+            composer_ids = [it["composerId"] for it in ws_items]
+            saved = export.checkpoint_project(
+                project_path,
+                composer_ids=composer_ids,
+                workspace_dir=ws_dir,
+                source_host=host or None,
+            )
+            batch_paths.extend(saved)
+            total_saved += len(saved)
 
-    snapshots_dir = paths.get_snapshots_dir()
-    if backend.has_remote():
-        print("  Pushing...", end="", flush=True)
-        if backend.push(snapshots_dir):
-            print(" done")
+        if not batch_paths:
+            continue
+
+        if backend.has_remote():
+            print(f"  [batch {batch_num}/{total_batches}] Pushing...", end="", flush=True)
+            ok = backend.push(snapshots_dir, paths=batch_paths)
+            if ok:
+                print(" done")
+            else:
+                print(" failed", file=sys.stderr)
+                print(
+                    "  Stopped after failed push. "
+                    "Re-run push to resume (pending commits + remaining ahead).",
+                    file=sys.stderr,
+                )
+                return total_saved
         else:
-            print(" failed", file=sys.stderr)
+            # Local-only: still commit the batch so work is not left unstaged
+            if isinstance(backend, GitBackend):
+                backend.push(snapshots_dir, paths=batch_paths)
 
     return total_saved
+
+
+def _backend_pull(
+    *,
+    previous_tip: Optional[str] = None,
+) -> tuple[bool, Optional[str], Optional[set[str]]]:
+    """Pull from remote. Returns (ok, new_tip, changed_composer_ids|None)."""
+    backend = get_backend()
+    snapshots_dir = paths.get_snapshots_dir()
+    if not backend.has_remote():
+        print("No remote configured, importing from local snapshots only.")
+        return True, None, None
+
+    print("Syncing with remote...", end="", flush=True)
+    if isinstance(backend, GitBackend):
+        ok = backend.pull(snapshots_dir, previous_tip=previous_tip)
+        tip = backend.last_pull_tip
+        changed = backend.last_changed_composer_ids
+    else:
+        ok = backend.pull(snapshots_dir)
+        tip = getattr(backend, "last_pull_tip", None)
+        changed = getattr(backend, "last_changed_composer_ids", None)
+    if ok:
+        print(" done")
+        if changed is not None:
+            print(f"  Remote delta: {len(changed)} conversation(s) changed")
+        return True, tip, changed
+    print(" failed", file=sys.stderr)
+    return False, None, None
+
+
+def _mark_pull_tip(tip: Optional[str]) -> None:
+    if not tip:
+        return
+    state = _load_sync_state()
+    state["lastSuccessfulRemoteTip"] = tip
+    _save_sync_state(state)
 
 
 def _push_ahead(
@@ -714,6 +806,7 @@ def _push_ahead(
     target_project_path: Optional[str] = None,
     target_workspace_dir: Optional[Path] = None,
     include_never_pushed: bool = False,
+    chunk_size: int = 10,
 ) -> int:
     """Find conversations ahead of snapshots and push them.
 
@@ -724,6 +817,7 @@ def _push_ahead(
         target_project_path: Optional target project path to scope search.
         target_workspace_dir: Optional target workspace directory to scope search.
         include_never_pushed: If True, include conversations that have never been pushed.
+        chunk_size: Conversations per commit/push batch.
 
     Returns the number of conversations pushed.
     """
@@ -732,12 +826,8 @@ def _push_ahead(
 
     if not auto:
         if backend.has_remote():
-            snapshots_dir = paths.get_snapshots_dir()
-            print("Syncing with remote...", end="", flush=True)
-            if backend.pull(snapshots_dir):
-                print(" done")
-            else:
-                print(" failed (continuing with local state)", file=sys.stderr)
+            state = _load_sync_state()
+            _backend_pull(previous_tip=state.get("lastSuccessfulRemoteTip"))
 
     ahead_items = _find_ahead_conversations(
         target_project_path=target_project_path,
@@ -757,7 +847,9 @@ def _push_ahead(
             if len(name) > 40:
                 name = name[:37] + "..."
             print(f"    {name} [{item['workspace_label']}]")
-        total = _export_and_push(sync_dir, ahead_items, backend=backend)
+        total = _export_and_push(
+            sync_dir, ahead_items, backend=backend, chunk_size=chunk_size
+        )
         if total == 0:
             print(
                 "  Warning: 0 conversation(s) exported. If chats exist in Cursor, "
@@ -797,7 +889,9 @@ def _push_ahead(
         return 0
 
     selected = [ahead_items[i - 1] for i in indices]
-    total = _export_and_push(sync_dir, selected, backend=backend)
+    total = _export_and_push(
+        sync_dir, selected, backend=backend, chunk_size=chunk_size
+    )
 
     if total == 0:
         print("No conversations exported.")
@@ -835,6 +929,7 @@ def _pull_behind(
     sync_dir: Path,
     target_project_path: Optional[str] = None,
     target_workspace_dir: Optional[Path] = None,
+    composer_ids: Optional[set[str]] = None,
 ) -> int:
     """Find all snapshots where local is behind and import them automatically.
 
@@ -842,8 +937,14 @@ def _pull_behind(
     conversation registered and imports only into those.  This prevents
     duplicating imports across every matching workspace.
 
+    If *composer_ids* is a set, only those composers are considered (git delta).
+    An empty set means nothing changed on remote.
+
     Returns the number of snapshots successfully imported.
     """
+    if composer_ids is not None and len(composer_ids) == 0:
+        return 0
+
     projects = list_snapshot_projects()
     if not projects:
         return 0
@@ -873,6 +974,8 @@ def _pull_behind(
                 meta = read_snapshot_meta(sf)
                 cid = meta.get("composerId")
                 if not cid:
+                    continue
+                if composer_ids is not None and cid not in composer_ids:
                     continue
 
                 # Skip snapshots we've already handled as diverged
@@ -977,15 +1080,17 @@ def cmd_sync(args):
     """Pull behind conversations then push ahead ones — fully automatic."""
     sync_dir = _require_sync_repo()
     backend = get_backend()
-    snapshots_dir = paths.get_snapshots_dir()
+    chunk_size = getattr(args, "chunk", 10) or 10
+
+    state = _load_sync_state()
+    prev_tip = state.get("lastSuccessfulRemoteTip")
+    changed_ids: Optional[set[str]] = None
+    new_tip: Optional[str] = None
 
     # Step 1: Pull remote → local snapshots
     if backend.has_remote():
-        print("Syncing with remote...", end="", flush=True)
-        if backend.pull(snapshots_dir):
-            print(" done")
-        else:
-            print(" failed", file=sys.stderr)
+        ok, new_tip, changed_ids = _backend_pull(previous_tip=prev_tip)
+        if not ok:
             return
 
     # Determine scope: local (current directory), workspace selector, or project path
@@ -1007,11 +1112,17 @@ def cmd_sync(args):
 
     # Step 2: Import — pull behind conversations from snapshots into Cursor DBs
     print("\n── Pull ──")
-    imported = _pull_behind(sync_dir, target_project_path=target_project_path, target_workspace_dir=target_workspace_dir)
+    imported = _pull_behind(
+        sync_dir,
+        target_project_path=target_project_path,
+        target_workspace_dir=target_workspace_dir,
+        composer_ids=changed_ids,
+    )
     if imported > 0:
         print(f"  Imported {imported} conversation(s)")
     else:
         print("  Everything up to date")
+    _mark_pull_tip(new_tip)
 
     # Step 3: Push — export ahead conversations from Cursor DBs into snapshots
     print("\n── Push ──")
@@ -1023,6 +1134,7 @@ def cmd_sync(args):
         target_project_path=target_project_path,
         target_workspace_dir=target_workspace_dir,
         include_never_pushed=include_never,
+        chunk_size=chunk_size,
     )
     if pushed == 0:
         print("  Nothing to push")
@@ -1041,22 +1153,30 @@ def cmd_sync(args):
     else:
         print("Already in sync.")
 
-
 def cmd_push(args):
     """Checkpoint + push in one command."""
     sync_dir = _require_sync_repo()
     backend = get_backend()
     snapshots_dir = paths.get_snapshots_dir()
+    chunk_size = getattr(args, "chunk", 10) or 10
 
     if getattr(args, "ahead", False) or getattr(args, "global_sync", False):
         # If --all is also set, push ALL conversations across ALL workspaces (full global backup)
         include_never = getattr(args, "all_chats", False)
-        _push_ahead(sync_dir, auto=True, backend=backend, include_never_pushed=include_never)
+        _push_ahead(
+            sync_dir,
+            auto=True,
+            backend=backend,
+            include_never_pushed=include_never,
+            chunk_size=chunk_size,
+        )
         return
 
-    # Step 0: Pull latest from remote
+    # Step 0: Pull latest from remote (refuse if dirty handled inside backend)
     if backend.has_remote():
-        if not backend.pull(snapshots_dir):
+        state = _load_sync_state()
+        ok, _, _ = _backend_pull(previous_tip=state.get("lastSuccessfulRemoteTip"))
+        if not ok:
             print("Warning: Could not sync with remote, continuing anyway...", file=sys.stderr)
 
     # Resolve workspace and select conversations
@@ -1078,33 +1198,65 @@ def cmd_push(args):
             print("No conversations selected.")
             return
 
-    # Step 1: Checkpoint
+    # Build ahead-style items for chunked export+push
+    items = []
+    for cid in (composer_ids or []):
+        items.append({
+            "composerId": cid,
+            "project_path": project_path,
+            "workspace_dir": workspace_dir,
+            "host": source_host,
+            "name": cid[:12],
+            "workspace_label": os.path.basename(project_path),
+        })
+
     if composer_ids:
         print(f"\nCheckpointing {len(composer_ids)} conversation(s)...")
+        total = _export_and_push(sync_dir, items, backend=backend, chunk_size=chunk_size)
     else:
+        # --all for current workspace: checkpoint all then push in chunks via ahead list
         print(f"Checkpointing all conversations for {project_path}...")
-    saved = export.checkpoint_project(
-        project_path, composer_ids=composer_ids,
-        workspace_dir=workspace_dir, source_host=source_host,
-    )
+        # Use find-ahead scoped to this workspace for chunked push of everything selected
+        all_items = _find_ahead_conversations(
+            target_project_path=project_path,
+            target_workspace_dir=workspace_dir,
+            include_never_pushed=True,
+        )
+        if not all_items:
+            # Fall back: export everything then one push (still chunked by re-listing)
+            saved = export.checkpoint_project(
+                project_path,
+                workspace_dir=workspace_dir,
+                source_host=source_host,
+            )
+            if not saved:
+                print("No conversations found to checkpoint.")
+                return
+            # Push in path chunks of 10
+            for i in range(0, len(saved), chunk_size):
+                batch = saved[i : i + chunk_size]
+                bn = i // chunk_size + 1
+                tb = (len(saved) + chunk_size - 1) // chunk_size
+                print(f"  [batch {bn}/{tb}] Pushing {len(batch)} file(s)...", end="", flush=True)
+                if backend.has_remote():
+                    if backend.push(snapshots_dir, paths=batch):
+                        print(" done")
+                    else:
+                        print(" failed", file=sys.stderr)
+                        return
+                else:
+                    if isinstance(backend, GitBackend):
+                        backend.push(snapshots_dir, paths=batch)
+                    print(" done")
+            print(f"\nDone. {len(saved)} conversation(s) saved.")
+            return
+        total = _export_and_push(sync_dir, all_items, backend=backend, chunk_size=chunk_size)
 
-    if not saved:
+    if not total:
         print("No conversations found to checkpoint.")
         return
 
-    print(f"  {len(saved)} conversation(s) checkpointed")
-
-    # Step 2: Push to remote
-    if backend.has_remote():
-        print("  Pushing...", end="", flush=True)
-        if backend.push(snapshots_dir):
-            print(" done")
-        else:
-            print(" failed", file=sys.stderr)
-    else:
-        print("  No remote configured, skipping push")
-
-    print(f"\nDone. {len(saved)} conversation(s) saved.")
+    print(f"\nDone. {total} conversation(s) saved.")
 
 
 def _git_pull_quiet(sync_dir: Path) -> bool:
@@ -1123,42 +1275,32 @@ def _commit_and_push(sync_dir: Path, message: str) -> bool:
     return True
 
 
-def _backend_pull() -> bool:
-    """Pull latest snapshots from the configured backend."""
-    backend = get_backend()
-    snapshots_dir = paths.get_snapshots_dir()
-
-    if not backend.has_remote():
-        print("No remote configured, importing from local snapshots only.")
-        return True
-
-    print("Syncing with remote...", end="", flush=True)
-    if backend.pull(snapshots_dir):
-        print(" done")
-        return True
-    else:
-        print(" failed", file=sys.stderr)
-        return False
-
-
 def cmd_pull(args):
     """Pull + import snapshots in one command."""
     sync_dir = _require_sync_repo()
+    reconcile_all = getattr(args, "reconcile_all", False)
+
+    state = _load_sync_state()
+    prev_tip = None if reconcile_all else state.get("lastSuccessfulRemoteTip")
 
     # Step 1: Pull from remote
-    if not _backend_pull():
+    ok, new_tip, changed_ids = _backend_pull(previous_tip=prev_tip)
+    if not ok:
         return
+    if reconcile_all:
+        changed_ids = None  # full scan
 
     # If --global is set, pull behind chats for all workspaces
     if getattr(args, "global_sync", False):
         print("\n── Pull (Global) ──")
-        imported = _pull_behind(sync_dir)
+        imported = _pull_behind(sync_dir, composer_ids=changed_ids)
         if imported > 0:
             print(f"  Imported {imported} conversation(s)")
             from .reload import print_reload_hint
             print_reload_hint()
         else:
             print("  Everything up to date")
+        _mark_pull_tip(new_tip)
         return
 
     # Step 2: Select what to import
@@ -1262,6 +1404,7 @@ def cmd_pull(args):
         print(f"\nDone: {total_success} imported, {total_failure} failed.")
         if total_success > 0:
             _maybe_reload(args)
+        _mark_pull_tip(new_tip)
     else:
         # Non-interactive: import for the resolved project/workspace
         project_path, workspace_dir = _resolve_workspace_for_import(args)
@@ -1280,10 +1423,14 @@ def cmd_pull(args):
             project_path,
             force=args.force,
             target_workspace_dir=workspace_dir,
+            composer_ids=changed_ids,
+            reconcile_all=reconcile_all,
         )
 
+        _mark_pull_tip(new_tip)
+
         if success == 0 and failure == 0:
-            print("No snapshots found to import.")
+            print("No snapshots to import (up to date or none found).")
             return
 
         print(f"\nDone: {success} imported, {failure} failed.")
@@ -2037,6 +2184,10 @@ def main():
         "--local", "-l", action="store_true",
         help="Push only the current project/workspace conversations (default)",
     )
+    p_push.add_argument(
+        "--chunk", type=int, default=10, metavar="N",
+        help="Conversations per commit/push batch (default: 10)",
+    )
     p_push.set_defaults(func=cmd_push)
 
     # ── pull ────────────────────────────────────────────────────────
@@ -2059,6 +2210,10 @@ def main():
     p_pull.add_argument(
         "--local", "-l", action="store_true",
         help="Pull only for the current project/workspace (default)",
+    )
+    p_pull.add_argument(
+        "--all", dest="reconcile_all", action="store_true",
+        help="Full reconcile: ignore git delta / up-to-date meta skips",
     )
     p_pull.add_argument(
         "--force", action="store_true",
@@ -2085,6 +2240,10 @@ def main():
     p_sync.add_argument(
         "--all", dest="all_chats", action="store_true",
         help="Sync all conversations, including those never pushed before",
+    )
+    p_sync.add_argument(
+        "--chunk", type=int, default=10, metavar="N",
+        help="Conversations per commit/push batch (default: 10)",
     )
     add_project_args(p_sync)
     p_sync.set_defaults(func=cmd_sync)

@@ -313,6 +313,17 @@ class CursorDB:
         except sqlite3.OperationalError:
             return {}
 
+    def get_items_by_keys(self, keys: list[str], table: str = "cursorDiskKV") -> dict[str, str]:
+        """Get multiple string values by exact keys (batched IN queries)."""
+        raw = self.get_items_by_keys_binary(keys, table=table)
+        out: dict[str, str] = {}
+        for k, v in raw.items():
+            if isinstance(v, bytes):
+                out[k] = v.decode("utf-8", errors="replace")
+            elif v is not None:
+                out[k] = str(v)
+        return out
+
     # ── Write operations (on original file) ─────────────────────────
 
     def _get_write_conn(self) -> sqlite3.Connection:
