@@ -1667,7 +1667,7 @@ def _cmd_doctor_collapse(args):
             best = max(g["members"], key=lambda m: m["chat_count"])
             print(
                 f"  python -m cursor_saves doctor --collapse --dry-run "
-                f"--target {best['hash'][:8]}"
+                f"--target {best['hash']}"
             )
             print(f"    # {g['canonical_path']} → {best['label']}")
             print()

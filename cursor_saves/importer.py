@@ -1559,6 +1559,7 @@ def _set_workspace_composer_membership(
     composer_id: str,
     *,
     present: bool,
+    header_entry: Optional[dict] = None,
 ) -> None:
     """Add or remove composerId from a workspace's local composer.composerData lists."""
     ws_db_path = ws_dir / "state.vscdb"
@@ -1581,12 +1582,28 @@ def _set_workspace_composer_membership(
         selected = _list_field("selectedComposerIds")
         focused = _list_field("lastFocusedComposerIds")
         all_composers = _list_field("allComposers")
+        has_all_composers = "allComposers" in existing
 
         if present:
             if composer_id not in selected:
                 selected.append(composer_id)
             if focused and composer_id not in focused:
                 focused.append(composer_id)
+            # Cursor 2.x workspaces keep sidebar rows in allComposers — mirror
+            # _register_in_workspace so collapse does not drop local entries.
+            if has_all_composers:
+                existing_ids = {
+                    c.get("composerId")
+                    for c in all_composers
+                    if isinstance(c, dict)
+                }
+                if composer_id not in existing_ids:
+                    if isinstance(header_entry, dict):
+                        row = dict(header_entry)
+                        row["composerId"] = composer_id
+                        all_composers.append(row)
+                    else:
+                        all_composers.append({"composerId": composer_id})
         else:
             selected = [c for c in selected if c != composer_id]
             focused = [c for c in focused if c != composer_id]
@@ -1599,11 +1616,41 @@ def _set_workspace_composer_membership(
         existing["selectedComposerIds"] = selected
         if "lastFocusedComposerIds" in existing or focused:
             existing["lastFocusedComposerIds"] = focused
-        if "allComposers" in existing:
+        if has_all_composers:
             existing["allComposers"] = all_composers
         ws_cdb.write_json("composer.composerData", existing, table="ItemTable")
     finally:
         ws_cdb.close()
+
+
+def _resolve_collapse_member(
+    needle: str,
+    groups: list[dict],
+) -> tuple[Optional[dict], Optional[dict]]:
+    """Resolve a full hash or unique prefix to (group, member).
+
+    Searches **all** collapse groups. Exact hash wins; otherwise the prefix
+    must match exactly one member globally (avoids cross-project collapse).
+    Returns (None, None) if missing or ambiguous.
+    """
+    if not needle:
+        return None, None
+    matches: list[tuple[dict, dict]] = []
+    for g in groups:
+        for m in g["members"]:
+            h = m["hash"]
+            if h == needle or h.startswith(needle):
+                matches.append((g, m))
+    if not matches:
+        return None, None
+    exact = [(g, m) for g, m in matches if m["hash"] == needle]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        return None, None
+    if len(matches) == 1:
+        return matches[0]
+    return None, None
 
 
 def collapse_duplicate_workspaces(
@@ -1642,43 +1689,53 @@ def collapse_duplicate_workspaces(
         return stats
 
     groups = list_collapse_groups()
-    group = None
-    for g in groups:
-        hashes = {m["hash"] for m in g["members"]}
-        if target_hash in hashes or any(m["hash"].startswith(target_hash) for m in g["members"]):
-            # Allow short prefix match unique within group
-            matches = [m for m in g["members"] if m["hash"] == target_hash or m["hash"].startswith(target_hash)]
-            if len(matches) == 1:
-                target_hash = matches[0]["hash"]
-                group = g
-                break
-            if any(m["hash"] == target_hash for m in g["members"]):
-                group = g
-                break
-    if group is None:
-        print(f"No collapse group contains workspace hash {target_hash!r}.", file=sys.stderr)
+    group, target = _resolve_collapse_member(target_hash, groups)
+    if group is None or target is None:
+        # Distinguish missing vs ambiguous for clearer errors
+        any_prefix = any(
+            m["hash"] == target_hash or m["hash"].startswith(target_hash)
+            for g in groups
+            for m in g["members"]
+        )
+        if any_prefix:
+            print(
+                f"Ambiguous workspace hash prefix {target_hash!r} — "
+                f"matches multiple workspaces. Pass a longer unique prefix "
+                f"or the full hash.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"No collapse group contains workspace hash {target_hash!r}.",
+                file=sys.stderr,
+            )
         print("Run: cursaves doctor --collapse --dry-run", file=sys.stderr)
         return stats
 
+    target_hash = target["hash"]
+    stats["target_hash"] = target_hash
     stats["canonical_path"] = group["canonical_path"]
-    members_by_hash = {m["hash"]: m for m in group["members"]}
-    target = members_by_hash.get(target_hash)
-    if not target:
-        print(f"Target hash {target_hash!r} not in group.", file=sys.stderr)
-        return stats
 
     if source_hashes is None:
         sources = [m for m in group["members"] if m["hash"] != target_hash]
     else:
         resolved = []
         for sh in source_hashes:
-            hits = [m for m in group["members"] if m["hash"] == sh or m["hash"].startswith(sh)]
-            if len(hits) != 1:
-                print(f"Ambiguous or unknown source hash {sh!r}.", file=sys.stderr)
-                return stats
-            if hits[0]["hash"] == target_hash:
+            src_group, src_member = _resolve_collapse_member(sh, [group])
+            if src_member is None:
+                # Also allow resolving within this group only with clear error
+                hits = [
+                    m
+                    for m in group["members"]
+                    if m["hash"] == sh or m["hash"].startswith(sh)
+                ]
+                if len(hits) != 1:
+                    print(f"Ambiguous or unknown source hash {sh!r}.", file=sys.stderr)
+                    return stats
+                src_member = hits[0]
+            if src_member["hash"] == target_hash:
                 continue
-            resolved.append(hits[0])
+            resolved.append(src_member)
         sources = resolved
 
     target_wi = _normalize_workspace_identifier(
@@ -1777,7 +1834,10 @@ def collapse_duplicate_workspaces(
                 src["workspace_dir"], cid, present=False
             )
             _set_workspace_composer_membership(
-                target["workspace_dir"], cid, present=True
+                target["workspace_dir"],
+                cid,
+                present=True,
+                header_entry=entry,
             )
 
             name = entry.get("name") or "(unnamed)"
