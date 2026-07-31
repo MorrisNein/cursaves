@@ -127,16 +127,20 @@ def _personal_cursor_home() -> Path:
     return Path.home() / ".cursor"
 
 
-def _log_wsl_skip(reason: str) -> None:
+def _log_wsl_skip(reason: str, *, action: str = "mirror") -> None:
+    """Log a one-shot WSL skip. action is 'export' or 'mirror'."""
     global _wsl_log_done
     if _wsl_log_done:
         return
     _wsl_log_done = True
-    print(f"  Agent-config: WSL personal mirror skipped ({reason})", file=sys.stderr)
+    print(f"  Agent-config: WSL personal {action} skipped ({reason})", file=sys.stderr)
 
 
 def _detect_wsl_personal_cursor() -> Optional[Path]:
-    """Windows → \\\\wsl$\\Distro\\home\\user\\.cursor when WSL is available."""
+    """Windows → \\\\wsl$\\Distro\\home\\user\\.cursor for the default WSL distro only.
+
+    Uses bare ``wsl`` (default distro); does not enumerate other distros.
+    """
     if platform.system() != "Windows":
         return None
     try:
@@ -192,9 +196,10 @@ def _sync_tree(src_root: Path, dest_root: Path, *, relative_from: Path) -> int:
 def export_personal() -> int:
     """Copy ~/.cursor/{skills,rules,commands,agents} → sync personal/.
 
-    On Windows, also export from WSL ``~/.cursor`` when detectable. Windows
-    runs first; WSL overlays on conflict (LWW — later copy wins if bytes differ).
-    WSL export is best-effort and never aborts the Windows export.
+    On Windows, also export from the default WSL distro's ``~/.cursor`` when
+    detectable. Windows runs first; on path conflicts WSL always wins
+    (order-based overwrite, not mtime). WSL export is best-effort and never
+    aborts the Windows export.
     """
     cursor = _personal_cursor_home()
     dest_base = get_agent_config_dir() / "personal"
@@ -206,7 +211,7 @@ def export_personal() -> int:
         n += _sync_tree(src, dest_base / name, relative_from=src)
 
     # WSL export is best-effort — never abort Windows personal export.
-    # Windows first, then WSL so WSL overlays on conflicting bytes.
+    # Windows first, then WSL so WSL always wins on conflicting paths.
     wsl = _detect_wsl_personal_cursor()
     if wsl is not None:
         try:
@@ -215,8 +220,8 @@ def export_personal() -> int:
                 if not src.exists():
                     continue
                 n += _sync_tree(src, dest_base / name, relative_from=src)
-        except OSError:
-            _log_wsl_skip("export path error")
+        except Exception:
+            _log_wsl_skip("export path error", action="export")
     return n
 
 
@@ -242,7 +247,7 @@ def import_personal() -> int:
                     continue
                 n += _sync_tree(src, wsl / name, relative_from=src)
         except OSError:
-            _log_wsl_skip("mirror path error")
+            _log_wsl_skip("mirror path error", action="mirror")
     return n
 
 
