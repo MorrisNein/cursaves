@@ -12,6 +12,7 @@ from .reload import print_reload_hint
 from .watch import watch_loop
 from .backends import GitBackend, S3Backend, SyncBackend, get_backend, load_config, save_config
 from .importer import (
+    _local_composer_missing_blobs,
     collapse_duplicate_workspaces,
     copy_between_workspaces,
     doctor_audit,
@@ -1040,12 +1041,13 @@ def _pull_behind(
     across every matching workspace.
 
     If *composer_ids* is a set, those are git-delta candidates — each always
-    goes through ``import_snapshot`` (conflict check + plan heal). An empty
+    goes through ``import_snapshot`` (conflict check + blob/plan heal). An empty
     set means nothing changed on remote.
 
     When *composer_ids* is None (full scan), behind/not_local are imported;
-    up_to_date/local_ahead with ``planCount`` still go through import_snapshot
-    so plan heal is not skipped.
+    up_to_date/local_ahead still go through import_snapshot when plan heal or
+    missing content/agent blobs need healing (meta zero short-circuit, else
+    local probe — not “queue every v3”).
 
     Returns (imported_count, failure_count).
     """
@@ -1101,9 +1103,30 @@ def _pull_behind(
                 plan_count = meta.get("planCount") or 0
                 if status in ("behind", "not_local"):
                     to_import.append((sf, meta))
-                elif status in ("up_to_date", "local_ahead") and plan_count > 0:
-                    # Plan heal without requiring a behind chat body
-                    to_import.append((sf, meta))
+                elif status in ("up_to_date", "local_ahead"):
+                    content_present = "contentBlobCount" in meta
+                    agent_present = "agentBlobCount" in meta
+                    content_n = (
+                        (meta.get("contentBlobCount") or 0) if content_present else None
+                    )
+                    agent_n = (
+                        (meta.get("agentBlobCount") or 0) if agent_present else None
+                    )
+                    # Both blob counts present as 0 and no plans → nothing to heal
+                    if (
+                        content_present
+                        and agent_present
+                        and content_n == 0
+                        and agent_n == 0
+                        and plan_count == 0
+                    ):
+                        continue
+                    if plan_count > 0:
+                        to_import.append((sf, meta))
+                    elif global_cdb is not None and _local_composer_missing_blobs(
+                        global_cdb, cid
+                    ):
+                        to_import.append((sf, meta))
 
             if not to_import:
                 continue
@@ -1183,7 +1206,7 @@ def _pull_behind(
 
 
 def cmd_repair(args):
-    """Repair conversations with missing agent blobs by restoring from snapshots."""
+    """Restore missing content/agent blobs from snapshots (quit Cursor first)."""
     print("Scanning for missing blobs...")
     fixed, restored = repair_missing_blobs(verbose=True)
     if fixed > 0:
@@ -1192,7 +1215,7 @@ def cmd_repair(args):
     elif restored == 0 and fixed == 0:
         print("\nNo blobs could be restored from available snapshots.")
         print("To fix remaining conversations, re-push them from the original machine")
-        print("using the latest cursaves (which exports agent blobs).")
+        print("using the latest cursaves (which exports content and agent blobs).")
 
 
 def cmd_sync(args):
@@ -2398,7 +2421,11 @@ def main():
 
     # ── repair ─────────────────────────────────────────────────────
     p_repair = subparsers.add_parser(
-        "repair", help="Restore missing agent blobs from snapshots (fixes 'Blob not found' errors)"
+        "repair",
+        help=(
+            "Restore missing content/agent blobs from snapshots "
+            "(fixes 'Conversation data missing' / 'Blob not found'; quit Cursor first)"
+        ),
     )
     p_repair.set_defaults(func=cmd_repair)
 
