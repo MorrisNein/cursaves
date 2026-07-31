@@ -1,4 +1,4 @@
-"""Tests for agent-config pack sync (v0.9.12)."""
+"""Tests for agent-config pack sync (v0.9.13)."""
 
 from __future__ import annotations
 
@@ -272,6 +272,64 @@ class TestWslDetect(unittest.TestCase):
             ):
                 # First _sync_tree = Windows personal; second = WSL (raises)
                 n = acs.import_personal()
+            self.assertEqual(n, 1)
+
+    def test_export_includes_wsl_and_overlays_on_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            sync = tmp_path / "sync"
+            win = tmp_path / "win" / ".cursor"
+            wsl = tmp_path / "wsl" / ".cursor"
+            win_skill = win / "skills" / "shared" / "SKILL.md"
+            win_skill.parent.mkdir(parents=True)
+            win_skill.write_text("windows\n", encoding="utf-8")
+            (win / "skills" / "win-only" / "SKILL.md").parent.mkdir(parents=True)
+            (win / "skills" / "win-only" / "SKILL.md").write_text("win only\n", encoding="utf-8")
+            wsl_skill = wsl / "skills" / "shared" / "SKILL.md"
+            wsl_skill.parent.mkdir(parents=True)
+            wsl_skill.write_text("wsl wins\n", encoding="utf-8")
+            (wsl / "skills" / "wsl-only" / "SKILL.md").parent.mkdir(parents=True)
+            (wsl / "skills" / "wsl-only" / "SKILL.md").write_text("wsl only\n", encoding="utf-8")
+            acs._wsl_log_done = False
+
+            with (
+                patch.object(acs.paths, "get_sync_dir", return_value=sync),
+                patch.object(acs, "_personal_cursor_home", return_value=win),
+                patch.object(acs, "_detect_wsl_personal_cursor", return_value=wsl),
+            ):
+                n = acs.export_personal()
+            self.assertGreaterEqual(n, 3)
+            base = sync / "agent-config" / "personal" / "skills"
+            self.assertEqual(
+                (base / "shared" / "SKILL.md").read_text(encoding="utf-8"),
+                "wsl wins\n",
+            )
+            self.assertTrue((base / "win-only" / "SKILL.md").is_file())
+            self.assertTrue((base / "wsl-only" / "SKILL.md").is_file())
+
+    def test_export_wsl_error_does_not_abort_windows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            sync = tmp_path / "sync"
+            win = tmp_path / "win" / ".cursor"
+            skill = win / "skills" / "d" / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text("win\n", encoding="utf-8")
+            wsl = tmp_path / "wsl-cursor"
+            (wsl / "skills").mkdir(parents=True)
+            acs._wsl_log_done = False
+
+            with (
+                patch.object(acs.paths, "get_sync_dir", return_value=sync),
+                patch.object(acs, "_personal_cursor_home", return_value=win),
+                patch.object(acs, "_detect_wsl_personal_cursor", return_value=wsl),
+                patch.object(
+                    acs,
+                    "_sync_tree",
+                    side_effect=[1, OSError("wsl dead")],
+                ),
+            ):
+                n = acs.export_personal()
             self.assertEqual(n, 1)
 
 
