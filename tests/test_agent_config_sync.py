@@ -319,18 +319,27 @@ class TestWslDetect(unittest.TestCase):
             (wsl / "skills").mkdir(parents=True)
             acs._wsl_log_done = False
 
+            real_sync_tree = acs._sync_tree
+
+            def sync_tree_fail_wsl(src_root, dest_root, *, relative_from):
+                # Real Windows writes stay in the pack; only WSL sync fails.
+                try:
+                    Path(src_root).resolve().relative_to(wsl.resolve())
+                except ValueError:
+                    return real_sync_tree(src_root, dest_root, relative_from=relative_from)
+                raise OSError("wsl dead")
+
             with (
                 patch.object(acs.paths, "get_sync_dir", return_value=sync),
                 patch.object(acs, "_personal_cursor_home", return_value=win),
                 patch.object(acs, "_detect_wsl_personal_cursor", return_value=wsl),
-                patch.object(
-                    acs,
-                    "_sync_tree",
-                    side_effect=[1, OSError("wsl dead")],
-                ),
+                patch.object(acs, "_sync_tree", side_effect=sync_tree_fail_wsl),
             ):
                 n = acs.export_personal()
-            self.assertEqual(n, 1)
+            packed = sync / "agent-config" / "personal" / "skills" / "d" / "SKILL.md"
+            self.assertTrue(packed.is_file())
+            self.assertEqual(packed.read_text(encoding="utf-8"), "win\n")
+            self.assertGreaterEqual(n, 1)
 
 
 if __name__ == "__main__":
