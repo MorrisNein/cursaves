@@ -190,7 +190,12 @@ def _sync_tree(src_root: Path, dest_root: Path, *, relative_from: Path) -> int:
 
 
 def export_personal() -> int:
-    """Copy ~/.cursor/{skills,rules,commands,agents} → sync personal/."""
+    """Copy ~/.cursor/{skills,rules,commands,agents} → sync personal/.
+
+    On Windows, also export from WSL ``~/.cursor`` when detectable. Windows
+    runs first; WSL overlays on conflict (LWW — later copy wins if bytes differ).
+    WSL export is best-effort and never aborts the Windows export.
+    """
     cursor = _personal_cursor_home()
     dest_base = get_agent_config_dir() / "personal"
     n = 0
@@ -199,6 +204,19 @@ def export_personal() -> int:
         if not src.exists():
             continue
         n += _sync_tree(src, dest_base / name, relative_from=src)
+
+    # WSL export is best-effort — never abort Windows personal export.
+    # Windows first, then WSL so WSL overlays on conflicting bytes.
+    wsl = _detect_wsl_personal_cursor()
+    if wsl is not None:
+        try:
+            for name in _PERSONAL_DIRS:
+                src = wsl / name
+                if not src.exists():
+                    continue
+                n += _sync_tree(src, dest_base / name, relative_from=src)
+        except OSError:
+            _log_wsl_skip("export path error")
     return n
 
 
