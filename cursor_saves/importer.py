@@ -80,6 +80,9 @@ def read_snapshot_meta(snapshot_path: Path) -> dict:
     try:
         data = read_snapshot_file(snapshot_path)
         cd = data.get("composerData", {})
+        content_n = len(data.get("contentBlobs") or {})
+        agent_n = len(data.get("agentBlobs") or {})
+        plan_n = len(data.get("plans") or {})
         return {
             "composerId": data.get("composerId"),
             "name": cd.get("name"),
@@ -90,6 +93,9 @@ def read_snapshot_meta(snapshot_path: Path) -> dict:
             "sourceProjectPath": data.get("sourceProjectPath"),
             "projectIdentifier": data.get("projectIdentifier"),
             "version": data.get("version"),
+            "planCount": plan_n or None,
+            "contentBlobCount": content_n or None,
+            "agentBlobCount": agent_n or None,
         }
     except Exception:
         return {
@@ -372,6 +378,81 @@ def _check_conflict(
         return "incoming_newer"
 
 
+def _heal_missing_snapshot_blobs(
+    cdb: db.CursorDB,
+    content_blobs: Optional[dict],
+    agent_blobs: Optional[dict],
+) -> tuple[int, int]:
+    """Fill-only restore of content/agent blobs from a snapshot into *cdb*.
+
+    Never overwrites existing keys. Missing-checks use cursorDiskKV.
+    Returns (content_written, agent_written).
+    """
+    import base64
+
+    content_blobs = content_blobs or {}
+    agent_blobs = agent_blobs or {}
+    if not content_blobs and not agent_blobs:
+        return 0, 0
+
+    to_write: list[tuple[str, Any]] = []
+    content_n = 0
+    agent_n = 0
+
+    if content_blobs:
+        keys = [f"composer.content.{h}" for h in content_blobs]
+        existing = cdb.get_items_by_keys(keys, table="cursorDiskKV")
+        for h, val in content_blobs.items():
+            key = f"composer.content.{h}"
+            if existing.get(key) is None:
+                to_write.append((key, val))
+                content_n += 1
+
+    if agent_blobs:
+        keys = [f"agentKv:blob:{bid}" for bid in agent_blobs]
+        existing_bin = cdb.get_items_by_keys_binary(keys, table="cursorDiskKV")
+        for bid, bdata in agent_blobs.items():
+            key = f"agentKv:blob:{bid}"
+            if existing_bin.get(key) is None:
+                try:
+                    raw = base64.b64decode(bdata) if isinstance(bdata, str) else bdata
+                except Exception:
+                    continue
+                to_write.append((key, raw))
+                agent_n += 1
+
+    if to_write:
+        cdb.write_batch(to_write)
+    return content_n, agent_n
+
+
+def _local_composer_missing_blobs(cdb: db.CursorDB, composer_id: str) -> bool:
+    """True if local composer references content/agent blobs absent from DB."""
+    from .export import _collect_content_hashes, _extract_agent_blob_ids
+
+    cd = cdb.get_json(f"composerData:{composer_id}")
+    if not cd:
+        return False
+
+    bubbles = cdb.get_json_items_by_prefix(f"bubbleId:{composer_id}:")
+    hashes = _collect_content_hashes(cd, bubbles)
+    if hashes:
+        keys = [f"composer.content.{h}" for h in hashes]
+        existing = cdb.get_items_by_keys(keys, table="cursorDiskKV")
+        for key in keys:
+            if existing.get(key) is None:
+                return True
+
+    agent_ids = _extract_agent_blob_ids(cd)
+    if agent_ids:
+        keys = [f"agentKv:blob:{bid}" for bid in agent_ids]
+        existing_bin = cdb.get_items_by_keys_binary(keys, table="cursorDiskKV")
+        for key in keys:
+            if existing_bin.get(key) is None:
+                return True
+    return False
+
+
 def import_snapshot(
     snapshot_path: Path,
     target_project_path: str,
@@ -440,18 +521,25 @@ def import_snapshot(
     if conflict == "local_ahead":
         with db.CursorDB(global_db_path) as cdb:
             ld = cdb.get_json(f"composerData:{composer_id}")
+            cn, an = _heal_missing_snapshot_blobs(cdb, content_blobs, agent_blobs)
         local_count = len((ld or {}).get("fullConversationHeadersOnly", []))
         snap_count = len(headers)
         print(
             f"  Skipped: \"{chat_name}\" — local has {local_count} msgs, "
             f"snapshot has {snap_count} (local is newer, nothing to import)"
         )
+        if cn or an:
+            print(f"  Healed {cn} content / {an} agent blob(s)")
         # Still heal missing plan files for plan-mode chats
         _maybe_restore_plans(snapshot, composer_id, target_path, target_workspace_dir)
         return True
 
     if conflict == "identical":
         print(f"  Skipped: \"{chat_name}\" — already up to date ({len(headers)} msgs)")
+        with db.CursorDB(global_db_path) as cdb:
+            cn, an = _heal_missing_snapshot_blobs(cdb, content_blobs, agent_blobs)
+        if cn or an:
+            print(f"  Healed {cn} content / {an} agent blob(s)")
         _maybe_restore_plans(snapshot, composer_id, target_path, target_workspace_dir)
         return True
 
@@ -2170,12 +2258,12 @@ def copy_between_workspaces(
 
 
 def repair_missing_blobs(verbose: bool = False) -> tuple[int, int]:
-    """Scan all conversations for missing agentKv blobs and backfill from snapshots.
+    """Scan conversations for missing content/agent blobs and backfill from snapshots.
 
     Returns (conversations_repaired, blobs_restored).
     """
     import base64
-    from .export import _extract_agent_blob_ids
+    from .export import _collect_content_hashes, _extract_agent_blob_ids
 
     global_db_path = paths.get_global_db_path()
     if not global_db_path.exists():
@@ -2185,8 +2273,9 @@ def repair_missing_blobs(verbose: bool = False) -> tuple[int, int]:
     if not snapshots_dir.exists():
         return 0, 0
 
-    # Phase 1: Find conversations with missing blobs
-    missing_map: dict[str, set[str]] = {}  # composerId -> set of missing blob hex IDs
+    # Phase 1: Find conversations with missing content and/or agent blobs
+    missing_content: dict[str, set[str]] = {}  # composerId -> hashes
+    missing_agent: dict[str, set[str]] = {}  # composerId -> blob ids
 
     with db.CursorDB(global_db_path) as cdb:
         all_keys = cdb.list_keys("composerData:")
@@ -2194,41 +2283,57 @@ def repair_missing_blobs(verbose: bool = False) -> tuple[int, int]:
             cd = cdb.get_json(key)
             if not cd:
                 continue
+            cid = key.split(":", 1)[1]
+
+            bubbles = cdb.get_json_items_by_prefix(f"bubbleId:{cid}:")
+            hashes = _collect_content_hashes(cd, bubbles)
+            if hashes:
+                ckeys = [f"composer.content.{h}" for h in hashes]
+                existing = cdb.get_items_by_keys(ckeys, table="cursorDiskKV")
+                miss_h = {h for h in hashes if existing.get(f"composer.content.{h}") is None}
+                if miss_h:
+                    missing_content[cid] = miss_h
+
             refs = _extract_agent_blob_ids(cd)
-            if not refs:
-                continue
+            if refs:
+                akeys = [f"agentKv:blob:{bid}" for bid in refs]
+                existing_bin = cdb.get_items_by_keys_binary(akeys, table="cursorDiskKV")
+                miss_a = {bid for bid in refs if existing_bin.get(f"agentKv:blob:{bid}") is None}
+                if miss_a:
+                    missing_agent[cid] = miss_a
 
-            missing = set()
-            for bid in refs:
-                val = cdb.get_item_binary(f"agentKv:blob:{bid}", table="cursorDiskKV")
-                if val is None:
-                    missing.add(bid)
-
-            if missing:
-                cid = key.split(":", 1)[1]
-                missing_map[cid] = missing
-
-    if not missing_map:
+    if not missing_content and not missing_agent:
         if verbose:
             print("  No conversations with missing blobs.")
         return 0, 0
 
-    all_missing_ids = set()
-    for s in missing_map.values():
-        all_missing_ids |= s
+    all_missing_content = set()
+    for s in missing_content.values():
+        all_missing_content |= s
+    all_missing_agent = set()
+    for s in missing_agent.values():
+        all_missing_agent |= s
 
     if verbose:
-        print(f"  {len(missing_map)} conversation(s) with {len(all_missing_ids)} unique missing blob(s)")
+        n_conv = len(set(missing_content) | set(missing_agent))
+        print(
+            f"  {n_conv} conversation(s) with "
+            f"{len(all_missing_content)} missing content / "
+            f"{len(all_missing_agent)} missing agent blob(s)"
+        )
 
-    # Phase 2: Scan snapshots that contain agentBlobs (version >= 3).
-    # Only decompress snapshots that might contain the missing blobs.
-    restored_blobs: dict[str, bytes] = {}
+    # Phase 2: Scan snapshots (version >= 3)
+    restored_content: dict[str, str] = {}
+    restored_agent: dict[str, bytes] = {}
 
     for project_dir in snapshots_dir.iterdir():
         if not project_dir.is_dir():
             continue
         for sf in list_snapshot_files(project_dir):
-            if not all_missing_ids - set(restored_blobs.keys()):
+            if (
+                not all_missing_content - set(restored_content.keys())
+                and not all_missing_agent - set(restored_agent.keys())
+            ):
                 break
 
             meta = read_snapshot_meta(sf)
@@ -2243,53 +2348,80 @@ def repair_missing_blobs(verbose: bool = False) -> tuple[int, int]:
             except Exception:
                 continue
 
-            snap_blobs = snap.get("agentBlobs", {})
-            if not snap_blobs:
-                continue
-
             found_any = False
-            for bid, b64val in snap_blobs.items():
-                if bid in all_missing_ids and bid not in restored_blobs:
+            for h, val in (snap.get("contentBlobs") or {}).items():
+                if h in all_missing_content and h not in restored_content:
+                    restored_content[h] = val
+                    found_any = True
+
+            for bid, b64val in (snap.get("agentBlobs") or {}).items():
+                if bid in all_missing_agent and bid not in restored_agent:
                     try:
-                        restored_blobs[bid] = base64.b64decode(b64val)
+                        restored_agent[bid] = base64.b64decode(b64val)
                         found_any = True
                     except Exception:
                         pass
 
             if found_any and verbose:
-                count = sum(1 for b in snap_blobs if b in all_missing_ids)
-                print(f"    Found {count} matching blob(s)")
+                print(
+                    f"    Found "
+                    f"{sum(1 for h in (snap.get('contentBlobs') or {}) if h in all_missing_content)} content / "
+                    f"{sum(1 for b in (snap.get('agentBlobs') or {}) if b in all_missing_agent)} agent"
+                )
 
-        if not all_missing_ids - set(restored_blobs.keys()):
+        if (
+            not all_missing_content - set(restored_content.keys())
+            and not all_missing_agent - set(restored_agent.keys())
+        ):
             break
 
-    if not restored_blobs:
+    if not restored_content and not restored_agent:
         if verbose:
-            still_missing = len(all_missing_ids)
-            print(f"  No matching blobs found in snapshots ({still_missing} still missing)")
+            still = len(all_missing_content) + len(all_missing_agent)
+            print(f"  No matching blobs found in snapshots ({still} still missing)")
         return 0, 0
 
-    # Phase 3: Write restored blobs to the global DB
+    # Phase 3: Fill-only writes
     backup_path = db.backup_db(global_db_path)
     if verbose:
         print(f"  Backed up global DB to {backup_path.name}")
 
+    batch: list[tuple[str, Any]] = []
     with db.CursorDB(global_db_path) as cdb:
-        cdb.write_batch([
-            (f"agentKv:blob:{bid}", val)
-            for bid, val in restored_blobs.items()
-        ])
+        if restored_content:
+            ckeys = [f"composer.content.{h}" for h in restored_content]
+            existing = cdb.get_items_by_keys(ckeys, table="cursorDiskKV")
+            for h, val in restored_content.items():
+                key = f"composer.content.{h}"
+                if existing.get(key) is None:
+                    batch.append((key, val))
+        if restored_agent:
+            akeys = [f"agentKv:blob:{bid}" for bid in restored_agent]
+            existing_bin = cdb.get_items_by_keys_binary(akeys, table="cursorDiskKV")
+            for bid, val in restored_agent.items():
+                key = f"agentKv:blob:{bid}"
+                if existing_bin.get(key) is None:
+                    batch.append((key, val))
+        if batch:
+            cdb.write_batch(batch)
 
+    restored_c_ids = set(restored_content)
+    restored_a_ids = set(restored_agent)
     conversations_fixed = 0
-    for cid, missing in missing_map.items():
-        if missing & set(restored_blobs.keys()):
+    for cid in set(missing_content) | set(missing_agent):
+        if (missing_content.get(cid, set()) & restored_c_ids) or (
+            missing_agent.get(cid, set()) & restored_a_ids
+        ):
             conversations_fixed += 1
 
-    remaining = len(all_missing_ids) - len(restored_blobs)
+    remaining = (
+        len(all_missing_content - restored_c_ids)
+        + len(all_missing_agent - restored_a_ids)
+    )
     if verbose and remaining > 0:
         print(f"  {remaining} blob(s) not found in any snapshot (from conversations not yet pushed)")
 
-    return conversations_fixed, len(restored_blobs)
+    return conversations_fixed, len(batch)
 
 
 # ── Doctor: audit and recover orphaned chats ─────────────────────────

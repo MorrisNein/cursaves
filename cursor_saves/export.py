@@ -607,6 +607,8 @@ def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
         "version": snapshot.get("version"),
         "shardCount": num_shards if num_shards else None,
         "planCount": len(snapshot.get("plans") or []) or None,
+        "contentBlobCount": len(snapshot.get("contentBlobs") or {}) or None,
+        "agentBlobCount": len(snapshot.get("agentBlobs") or {}) or None,
     }
     meta_file = project_dir / f"{composer_id}.meta.json"
     meta_file.write_text(json.dumps(meta, indent=2))
