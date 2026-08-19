@@ -453,6 +453,27 @@ def _local_composer_missing_blobs(cdb: db.CursorDB, composer_id: str) -> bool:
     return False
 
 
+def _maybe_fix_subagent_registration(
+    composer_id: str,
+    composer_data: dict,
+    target_project_path: str,
+    target_workspace_dir: Optional[Path],
+    project_identifier: Optional[str],
+) -> None:
+    """Re-run subagent-aware registration (e.g. after identical skip on re-sync)."""
+    if not _is_subagent_composer(composer_id, composer_data):
+        return
+    ws_dir = target_workspace_dir
+    if ws_dir is None:
+        ws_dir = find_or_create_workspace(target_project_path)
+    _register_in_workspace(
+        composer_id,
+        composer_data,
+        ws_dir,
+        project_identifier=project_identifier,
+    )
+
+
 def import_snapshot(
     snapshot_path: Path,
     target_project_path: str,
@@ -532,6 +553,13 @@ def import_snapshot(
             print(f"  Healed {cn} content / {an} agent blob(s)")
         # Still heal missing plan files for plan-mode chats
         _maybe_restore_plans(snapshot, composer_id, target_path, target_workspace_dir)
+        _maybe_fix_subagent_registration(
+            composer_id,
+            composer_data,
+            target_path,
+            target_workspace_dir,
+            snapshot.get("projectIdentifier"),
+        )
         return True
 
     if conflict == "identical":
@@ -541,6 +569,13 @@ def import_snapshot(
         if cn or an:
             print(f"  Healed {cn} content / {an} agent blob(s)")
         _maybe_restore_plans(snapshot, composer_id, target_path, target_workspace_dir)
+        _maybe_fix_subagent_registration(
+            composer_id,
+            composer_data,
+            target_path,
+            target_workspace_dir,
+            snapshot.get("projectIdentifier"),
+        )
         return True
 
     if conflict == "new":
@@ -652,7 +687,12 @@ def import_snapshot(
         backup_path = db.backup_db(ws_db_path)
         print(f"  Backed up workspace DB to {backup_path.name}")
 
-    _register_in_workspace(composer_id, composer_data, ws_dir)
+    _register_in_workspace(
+        composer_id,
+        composer_data,
+        ws_dir,
+        project_identifier=snapshot.get("projectIdentifier"),
+    )
 
     # ── Step 3b: Restore linked Plan-mode .plan.md files ─────────────
     snap_plans = snapshot.get("plans") or []
@@ -1056,11 +1096,19 @@ def import_all_snapshots(
 # ── Local workspace copy ───────────────────────────────────────────────
 
 
+def _is_subagent_composer(composer_id: str, composer_data: dict) -> bool:
+    """True if this chat is a Cursor subagent (nested under a parent composer)."""
+    if composer_data.get("isSubagent") or composer_data.get("isBestOfNSubcomposer"):
+        return True
+    return isinstance(composer_id, str) and composer_id.startswith("task-")
+
+
 def _build_composer_header_entry(composer_id: str, composer_data: dict) -> dict:
     """Build a composer header entry suitable for both allComposers and
     composer.composerHeaders."""
     created = composer_data.get("createdAt", 0) or 0
     updated = composer_data.get("lastUpdatedAt", created) or created
+    is_sub = _is_subagent_composer(composer_id, composer_data)
     return {
         "type": composer_data.get("type") or "head",
         "composerId": composer_id,
@@ -1084,6 +1132,7 @@ def _build_composer_header_entry(composer_id: str, composer_data: dict) -> dict:
         "isBestOfNSubcomposer": bool(
             composer_data.get("isBestOfNSubcomposer") or False
         ),
+        "isSubagent": is_sub,
         "numSubComposers": len(composer_data.get("subComposerIds", [])),
         "referencedPlans": [],
         "trackedGitRepos": [],
@@ -1136,7 +1185,8 @@ def _upsert_native_composer_header(
     checkpoint = int(checkpoint_raw) if checkpoint_raw not in (None, "") else None
     is_archived = 1 if entry.get("isArchived") or cd.get("isArchived") else 0
     is_subagent = 1 if (
-        entry.get("isBestOfNSubcomposer")
+        entry.get("isSubagent")
+        or entry.get("isBestOfNSubcomposer")
         or cd.get("isBestOfNSubcomposer")
         or cd.get("isSubagent")
     ) else 0
@@ -2062,10 +2112,58 @@ def collapse_duplicate_workspaces(
     return stats
 
 
+def _parent_lists_child(global_cdb: "db.CursorDB", child_id: str) -> bool:
+    """True if any local parent composerData already references child_id."""
+    for key in global_cdb.list_keys("composerData:"):
+        cd = global_cdb.get_json(key)
+        if cd and child_id in (cd.get("subComposerIds") or []):
+            return True
+    return False
+
+
+def _link_subagent_to_parent_from_snapshots(
+    global_cdb: "db.CursorDB",
+    child_id: str,
+    project_identifier: Optional[str],
+) -> bool:
+    """Ensure a parent composerData lists child_id in subComposerIds (from sync snapshots)."""
+    if not project_identifier or _parent_lists_child(global_cdb, child_id):
+        return False
+
+    snapshots_dir = paths.get_snapshots_dir() / project_identifier
+    if not snapshots_dir.is_dir():
+        return False
+
+    for sf in list_snapshot_files(snapshots_dir):
+        try:
+            snap = read_snapshot_file(sf)
+        except Exception:
+            continue
+        parent_id = snap.get("composerId")
+        if not parent_id or parent_id == child_id:
+            continue
+        cd = snap.get("composerData") or {}
+        if child_id not in (cd.get("subComposerIds") or []):
+            continue
+        local_parent = global_cdb.get_json(f"composerData:{parent_id}")
+        if not local_parent or not isinstance(local_parent, dict):
+            continue
+        ids = list(local_parent.get("subComposerIds") or [])
+        if child_id in ids:
+            return True
+        ids.append(child_id)
+        local_parent["subComposerIds"] = ids
+        global_cdb.write_json(f"composerData:{parent_id}", local_parent)
+        return True
+    return False
+
+
 def _register_in_workspace(
     composer_id: str,
     composer_data: dict,
     ws_dir: Path,
+    *,
+    project_identifier: Optional[str] = None,
 ) -> bool:
     """Register a conversation in a workspace's sidebar.
 
@@ -2075,13 +2173,45 @@ def _register_in_workspace(
     For Cursor 3.0+, writes to the global composer.composerHeaders
     index (the authoritative source) and the workspace's
     selectedComposerIds.
+
+    Subagents are registered in global headers only — not promoted to
+    selectedComposerIds / allComposers (they nest under the parent chat).
     """
+    is_subagent = _is_subagent_composer(composer_id, composer_data)
+
+    global_db_path = paths.get_global_db_path()
+    if is_subagent and global_db_path.exists():
+        link_cdb = db.CursorDB(global_db_path)
+        try:
+            _link_subagent_to_parent_from_snapshots(
+                link_cdb, composer_id, project_identifier
+            )
+        finally:
+            link_cdb.close()
+
     ws_db_path = ws_dir / "state.vscdb"
     ws_cdb = db.CursorDB(ws_db_path)
     try:
         existing = ws_cdb.get_json("composer.composerData", table="ItemTable")
         if existing is None:
             existing = {"selectedComposerIds": []}
+
+        if is_subagent:
+            # Strip mistaken flat registration from prior imports.
+            if "allComposers" in existing:
+                existing["allComposers"] = [
+                    c for c in existing.get("allComposers", [])
+                    if c.get("composerId") != composer_id
+                ]
+            sel = [x for x in existing.get("selectedComposerIds", []) if x != composer_id]
+            existing["selectedComposerIds"] = sel
+            if "lastFocusedComposerIds" in existing:
+                existing["lastFocusedComposerIds"] = [
+                    x for x in existing["lastFocusedComposerIds"] if x != composer_id
+                ]
+            ws_cdb.write_json("composer.composerData", existing, table="ItemTable")
+            _register_in_global_headers(composer_id, composer_data, ws_dir)
+            return True
 
         is_migrated = "allComposers" not in existing
 
