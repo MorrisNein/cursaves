@@ -1673,18 +1673,6 @@ def list_collapse_groups() -> list[dict]:
       }]
     Only returns groups with 2+ members.
     """
-    global_db_path = paths.get_global_db_path()
-    chats_by_ws: dict[str, list[str]] = {}
-    if global_db_path.exists():
-        with db.CursorDB(global_db_path) as cdb:
-            for entry in cdb.list_native_composer_headers():
-                cid = entry.get("composerId")
-                wi = entry.get("workspaceIdentifier") or {}
-                wid = wi.get("id") if isinstance(wi, dict) else None
-                if not cid or not wid:
-                    continue
-                chats_by_ws.setdefault(wid, []).append(cid)
-
     by_canon: dict[str, list[dict]] = {}
     for ws in paths.list_all_workspaces():
         folder_uri = ws.get("folder_uri") or ""
@@ -1692,7 +1680,14 @@ def list_collapse_groups() -> list[dict]:
         if not canon:
             continue
         ws_hash = ws["workspace_dir"].name
-        chat_ids = list(chats_by_ws.get(ws_hash, []))
+        ws_db_path = ws["workspace_dir"] / "state.vscdb"
+        # Same membership sources as audit/workspaces: native headers, ItemTable
+        # JSON, selectedComposerIds, and pane state. Native SQL alone misses
+        # JSON-only leftovers after a partial collapse, which leaves duplicate
+        # workspace folders in the Agents sidebar.
+        chat_ids = (
+            paths.get_workspace_composer_ids(ws_db_path) if ws_db_path.exists() else []
+        )
         member = {
             "hash": ws_hash,
             "workspace_dir": ws["workspace_dir"],
