@@ -623,8 +623,7 @@ def import_snapshot(
 
     # ── Step 1: Backup global DB ────────────────────────────────────
     if not skip_backup and global_db_path.exists():
-        backup_path = db.backup_db(global_db_path)
-        print(f"  Backed up global DB to {backup_path.name}")
+        db.backup_db(global_db_path)
 
     # ── Step 2: Write conversation data to global DB ────────────────
     global_cdb = db.CursorDB(global_db_path)
@@ -677,50 +676,42 @@ def import_snapshot(
                     (f"agentKv:blob:{bid}", base64.b64decode(bdata))
                     for bid, bdata in agent_blobs.items()
                 ])
-    finally:
-        global_cdb.close()
 
-    # ── Step 3: Register conversation in workspace DB ───────────────
-    ws_db_path = ws_dir / "state.vscdb"
+        # ── Step 3: Register conversation in workspace DB ───────────────
+        ws_db_path = ws_dir / "state.vscdb"
 
-    if not skip_backup and ws_db_path.exists():
-        backup_path = db.backup_db(ws_db_path)
-        print(f"  Backed up workspace DB to {backup_path.name}")
+        if not skip_backup and ws_db_path.exists():
+            db.backup_db(ws_db_path)
 
-    _register_in_workspace(
-        composer_id,
-        composer_data,
-        ws_dir,
-        project_identifier=snapshot.get("projectIdentifier"),
-    )
+        _register_in_workspace(
+            composer_id,
+            composer_data,
+            ws_dir,
+            project_identifier=snapshot.get("projectIdentifier"),
+            global_cdb=global_cdb,
+        )
 
-    # ── Step 3b: Restore linked Plan-mode .plan.md files ─────────────
-    snap_plans = snapshot.get("plans") or []
-    if snap_plans:
-        plan_cdb = db.CursorDB(global_db_path)
-        try:
+        # ── Step 3b: Restore linked Plan-mode .plan.md files ─────────────
+        snap_plans = snapshot.get("plans") or []
+        if snap_plans:
             n_plans = plan_sync.restore_plans_for_composer(
                 snap_plans,
                 composer_id,
                 target_path,
                 ws_dir,
-                plan_cdb,
+                global_cdb,
             )
             if n_plans:
                 print(f"  Restored {n_plans} plan file(s)")
-        finally:
-            plan_cdb.close()
 
-    # ── Step 4: Verify writes ─────────────────────────────────────────
-    verify_cdb = db.CursorDB(global_db_path)
-    try:
-        written = verify_cdb.get_json(f"composerData:{composer_id}")
+        # ── Step 4: Verify writes ─────────────────────────────────────────
+        written = global_cdb.get_json(f"composerData:{composer_id}")
         if not written:
             print("  WARNING: composerData not found in global DB after write!", file=sys.stderr)
             return False
         if bubble_entries:
             sample_key = next(iter(bubble_entries))
-            sample = verify_cdb.get_json(f"bubbleId:{composer_id}:{sample_key}")
+            sample = global_cdb.get_json(f"bubbleId:{composer_id}:{sample_key}")
             if not sample:
                 print("  WARNING: bubble entries not found in global DB after write!", file=sys.stderr)
                 return False
@@ -736,7 +727,7 @@ def import_snapshot(
         else:
             print(f"  Done: \"{final_name}\" ({final_msgs} msgs)")
     finally:
-        verify_cdb.close()
+        global_cdb.close()
 
     return True
 
@@ -1005,20 +996,12 @@ def import_from_snapshot_dir(
     if not to_import:
         return 0, 0
 
-    # Back up DBs once for the entire batch (global DB can be multi-GB)
-    global_db_path = paths.get_global_db_path()
-    if global_db_path.exists():
-        backup_path = db.backup_db(global_db_path)
-        print(f"Backed up global DB to {backup_path.name}")
-
     if target_workspace_dir is not None:
         ws_dir = target_workspace_dir
     else:
         ws_dir = find_or_create_workspace(os.path.normpath(target_project_path))
-    ws_db_path = ws_dir / "state.vscdb"
-    if ws_db_path.exists():
-        backup_path = db.backup_db(ws_db_path)
-        print(f"Backed up workspace DB to {backup_path.name}")
+    # Back up DBs once for the entire batch (global DB can be multi-GB)
+    backup_cursor_dbs(ws_dir)
 
     success = 0
     failure = 0
@@ -1401,29 +1384,39 @@ def _register_in_global_headers(
     composer_id: str,
     composer_data: dict,
     ws_dir: Path,
+    global_cdb: Optional["db.CursorDB"] = None,
 ) -> None:
     """Register a conversation in Cursor's global chat indexes.
 
     Writes both:
-      1. Legacy ItemTable JSON key composer.composerHeaders (cursaves / older Cursor)
-      2. Native composerHeaders SQL table (Cursor 3.x sidebar)
+      1. Native composerHeaders SQL table (Cursor 3.x sidebar) — first, cheap
+      2. Legacy ItemTable JSON key composer.composerHeaders (older Cursor)
 
     Upserts on re-register so workspace moves update both indexes.
+    Pass an open *global_cdb* to avoid opening (and possibly copying) the
+    multi-GB global DB a second time.
     """
-    global_db_path = paths.get_global_db_path()
-    global_cdb = db.CursorDB(global_db_path)
+    own_cdb = global_cdb is None
+    if own_cdb:
+        global_cdb = db.CursorDB(paths.get_global_db_path())
     try:
-        headers = global_cdb.get_json("composer.composerHeaders", table="ItemTable")
-        if headers is None:
-            headers = {"allComposers": []}
-
-        all_composers = headers.get("allComposers", [])
+        # Prefer the write connection so header reads don't copy the DB.
+        if global_cdb.db_path.exists():
+            global_cdb._get_write_conn()
         workspace_identifier = _normalize_workspace_identifier(
             _build_workspace_identifier(ws_dir)
         )
         entry = _build_composer_header_entry(composer_id, composer_data)
         entry["workspaceIdentifier"] = workspace_identifier
 
+        # Native SQL first: this is what Cursor 3.x actually reads.
+        _upsert_native_composer_header(global_cdb, entry, composer_data)
+
+        headers = global_cdb.get_json("composer.composerHeaders", table="ItemTable")
+        if headers is None:
+            headers = {"allComposers": []}
+
+        all_composers = headers.get("allComposers", [])
         replaced = False
         for i, existing in enumerate(all_composers):
             if existing.get("composerId") == composer_id:
@@ -1435,7 +1428,6 @@ def _register_in_global_headers(
 
         headers["allComposers"] = all_composers
         global_cdb.write_json("composer.composerHeaders", headers, table="ItemTable")
-        _upsert_native_composer_header(global_cdb, entry, composer_data)
         # Agents sidebar also reads composerData.workspaceIdentifier — keep
         # it aligned with headers so import/recover don't reintroduce splits.
         _ensure_composer_data_workspace_identifier(
@@ -1443,7 +1435,8 @@ def _register_in_global_headers(
         )
         paths.invalidate_headers_cache()
     finally:
-        global_cdb.close()
+        if own_cdb:
+            global_cdb.close()
 
 
 def _ensure_composer_data_workspace_identifier(
@@ -2158,12 +2151,33 @@ def _link_subagent_to_parent_from_snapshots(
     return False
 
 
+def backup_cursor_dbs(
+    workspace_dir: Optional[Path] = None,
+    *,
+    include_global: bool = True,
+) -> None:
+    """Backup the global DB and optional workspace DB once.
+
+    The global DB is commonly multiple GB; callers that import several
+    chats should call this once and then pass skip_backup=True.
+    """
+    if include_global:
+        global_db_path = paths.get_global_db_path()
+        if global_db_path.exists():
+            db.backup_db(global_db_path)
+    if workspace_dir is not None:
+        ws_db_path = workspace_dir / "state.vscdb"
+        if ws_db_path.exists():
+            db.backup_db(ws_db_path)
+
+
 def _register_in_workspace(
     composer_id: str,
     composer_data: dict,
     ws_dir: Path,
     *,
     project_identifier: Optional[str] = None,
+    global_cdb: Optional["db.CursorDB"] = None,
 ) -> bool:
     """Register a conversation in a workspace's sidebar.
 
@@ -2210,7 +2224,9 @@ def _register_in_workspace(
                     x for x in existing["lastFocusedComposerIds"] if x != composer_id
                 ]
             ws_cdb.write_json("composer.composerData", existing, table="ItemTable")
-            _register_in_global_headers(composer_id, composer_data, ws_dir)
+            _register_in_global_headers(
+                composer_id, composer_data, ws_dir, global_cdb=global_cdb
+            )
             return True
 
         is_migrated = "allComposers" not in existing
@@ -2243,7 +2259,9 @@ def _register_in_workspace(
 
         # Keep Cursor's global indexes updated (ItemTable JSON + native SQL table).
         # Required for imported chats to appear in the Cursor 3.x sidebar.
-        _register_in_global_headers(composer_id, composer_data, ws_dir)
+        _register_in_global_headers(
+            composer_id, composer_data, ws_dir, global_cdb=global_cdb
+        )
 
         return True
     finally:
