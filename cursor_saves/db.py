@@ -480,6 +480,45 @@ def _file_mb(path: Path) -> float:
         return 0.0
 
 
+_COPY_CHUNK = 8 * 1024 * 1024  # 8 MiB — small enough that Ctrl+C is noticed
+
+
+def _copy_file_bytes(src: Path, dst: Path) -> None:
+    """Byte-copy *src* to *dst* in Python chunks so KeyboardInterrupt works.
+
+    shutil.copy2 uses sendfile/fcopyfile — a single uninterruptible kernel
+    call — which is why Ctrl+C appears to do nothing during a multi-GB backup.
+    """
+    total = src.stat().st_size
+    copied = 0
+    last_report = time.monotonic()
+    if dst.exists():
+        dst.unlink()
+    try:
+        with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+            while True:
+                buf = fsrc.read(_COPY_CHUNK)
+                if not buf:
+                    break
+                fdst.write(buf)
+                copied += len(buf)
+                now = time.monotonic()
+                if total >= 50 * 1024 * 1024 and now - last_report >= 2.0:
+                    print(
+                        f"    {copied / (1024 * 1024):.0f} / {total / (1024 * 1024):.0f} MB "
+                        f"(Ctrl+C to abort)",
+                        flush=True,
+                    )
+                    last_report = now
+        shutil.copystat(src, dst, follow_symlinks=True)
+    except BaseException:
+        try:
+            dst.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def _copy_file_fast(src: Path, dst: Path) -> str:
     """Copy *src* to *dst*, using a copy-on-write clone when the FS supports it.
 
@@ -527,7 +566,7 @@ def _copy_file_fast(src: Path, dst: Path) -> str:
                 except OSError:
                     pass
 
-    shutil.copy2(src, dst)
+    _copy_file_bytes(src, dst)
     return "copy"
 
 
@@ -555,11 +594,19 @@ def backup_db(db_path: Path, keep: int = 2) -> Path:
     print(f"  Backing up {db_path.name} ({size_mb:.0f} MB{extra})...", flush=True)
     t0 = time.monotonic()
 
-    method = _copy_file_fast(db_path, backup_path)
-    for suffix in ("-wal", "-shm"):
-        sidecar = db_path.parent / (db_path.name + suffix)
-        if sidecar.exists():
-            _copy_file_fast(sidecar, db_path.parent / (backup_path.name + suffix))
+    try:
+        method = _copy_file_fast(db_path, backup_path)
+        for suffix in ("-wal", "-shm"):
+            sidecar = db_path.parent / (db_path.name + suffix)
+            if sidecar.exists():
+                _copy_file_fast(sidecar, db_path.parent / (backup_path.name + suffix))
+    except KeyboardInterrupt:
+        print("  Backup aborted (original DB untouched).", file=sys.stderr, flush=True)
+        for leftover in (backup_path, *(
+            db_path.parent / (backup_path.name + s) for s in ("-wal", "-shm")
+        )):
+            leftover.unlink(missing_ok=True)
+        raise
 
     elapsed = time.monotonic() - t0
     how = "Cloned" if method == "clone" else "Copied"

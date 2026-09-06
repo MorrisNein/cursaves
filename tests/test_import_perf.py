@@ -27,6 +27,33 @@ def _init_db(path: Path) -> None:
 
 
 class TestFastFileCopy(unittest.TestCase):
+    def test_copy_file_bytes_is_interruptible_and_cleans_dst(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src.bin"
+            dst = Path(tmp) / "dst.bin"
+            src.write_bytes(b"x" * (db._COPY_CHUNK * 4))
+            reads = {"n": 0}
+            real_open = open
+
+            def wrapping_open(path, mode="r", *args, **kwargs):
+                fh = real_open(path, mode, *args, **kwargs)
+                if "r" in mode and Path(path) == src:
+                    inner_read = fh.read
+
+                    def counting_read(n=-1):
+                        reads["n"] += 1
+                        if reads["n"] >= 2:
+                            raise KeyboardInterrupt
+                        return inner_read(n)
+
+                    fh.read = counting_read  # type: ignore[method-assign]
+                return fh
+
+            with patch("cursor_saves.db.open", wrapping_open):
+                with self.assertRaises(KeyboardInterrupt):
+                    db._copy_file_bytes(src, dst)
+            self.assertFalse(dst.exists())
+
     def test_copy_file_fast_preserves_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = Path(tmp) / "src.bin"
