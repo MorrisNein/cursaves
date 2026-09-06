@@ -1,9 +1,12 @@
 """Safe SQLite reader/writer for Cursor's state.vscdb databases."""
 
 import json
+import os
 import shutil
 import sqlite3
+import sys
 import tempfile
+import time
 from pathlib import Path
 from contextlib import contextmanager
 from typing import Any, Optional
@@ -12,9 +15,10 @@ from typing import Any, Optional
 class CursorDB:
     """Safe interface to a Cursor state.vscdb database.
 
-    All reads are performed on a temporary copy of the database to avoid
-    locking conflicts with a running Cursor instance. Writes operate on
-    the original file and require Cursor to be closed.
+    Reads use a direct SQLite URI when possible (no multi-GB copy). If that
+    fails, they fall back to a temporary copy so a running Cursor instance
+    cannot lock us out. Writes operate on the original file and require
+    Cursor to be closed.
     """
 
     def __init__(self, db_path: Path, no_copy: bool = True):
@@ -38,47 +42,83 @@ class CursorDB:
         for table in tables:
             conn.execute(f"SELECT key FROM {table} LIMIT 1").fetchone()
 
+    def _try_uri_readonly(self, query: str) -> Optional[sqlite3.Connection]:
+        """Open a read-only URI connection and probe Cursor tables. None on failure."""
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            db_uri = f"{self.db_path.resolve().as_uri()}?{query}"
+            conn = sqlite3.connect(db_uri, uri=True, timeout=30)
+            conn.execute("SELECT 1").fetchone()
+            self._probe_readable(conn)
+            return conn
+        except sqlite3.OperationalError:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            return None
+
     def _ensure_read_copy(self) -> sqlite3.Connection:
-        """Copy the database to a temp file and open a read-only connection."""
+        """Open a read connection, copying the DB only as a last resort.
+
+        A full copy of Cursor's global DB is often multi-GB and is the usual
+        reason a tiny import appears to hang for minutes.
+        """
         if self._conn is not None:
             return self._conn
 
         if not self.db_path.exists():
             raise FileNotFoundError(f"Database not found: {self.db_path}")
 
-        # Try to connect directly in read-only and lock-free mode for speed.
-        # Must validate real table reads: nolock can open the file but return an
-        # empty/unreadable WAL view (paths with spaces, or Cursor actively writing).
+        # 1) nolock URI — fastest, works while Cursor is running.
+        # 2) mode=ro without nolock — proper WAL view; needed when nolock
+        #    returns empty tables (macOS paths with spaces, active writer).
+        # 3) Copy WAL+main to temp — last resort only.
         if self.no_copy:
-            try:
-                db_uri = f"{self.db_path.resolve().as_uri()}?mode=ro&nolock=1"
-                conn = sqlite3.connect(db_uri, uri=True)
-                conn.execute("SELECT 1").fetchone()
-                self._probe_readable(conn)
-                self._conn = conn
-                return self._conn
-            except sqlite3.OperationalError:
-                pass
+            for query in ("mode=ro&nolock=1", "mode=ro"):
+                conn = self._try_uri_readonly(query)
+                if conn is not None:
+                    self._conn = conn
+                    return self._conn
 
-        # Copy the main db file and any WAL/SHM files
+        size_mb = _file_mb(self.db_path)
+        if size_mb >= 50:
+            print(
+                f"  Note: copying {size_mb:.0f} MB database for a consistent read "
+                f"(direct SQLite open failed). This can take a while.",
+                file=sys.stderr,
+                flush=True,
+            )
+
         tmp_dir = tempfile.mkdtemp(prefix="cursaves-")
         tmp_db = Path(tmp_dir) / "state.vscdb"
-        shutil.copy2(self.db_path, tmp_db)
+        _copy_file_fast(self.db_path, tmp_db)
 
-        # Also copy WAL and SHM if they exist (needed for recent writes)
         for suffix in ("-wal", "-shm"):
             wal_file = self.db_path.parent / (self.db_path.name + suffix)
             if wal_file.exists():
-                shutil.copy2(wal_file, Path(tmp_dir) / (tmp_db.name + suffix))
+                _copy_file_fast(wal_file, Path(tmp_dir) / (tmp_db.name + suffix))
 
         self._tmp_path = tmp_db
         self._conn = sqlite3.connect(str(tmp_db))
-        # Checkpoint WAL into main db for consistent reads
         try:
             self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except sqlite3.OperationalError:
-            pass  # Not in WAL mode, that's fine
+            pass
         return self._conn
+
+    def _query_conn(self) -> sqlite3.Connection:
+        """Connection for reads: reuse an open write conn, else a read conn.
+
+        Import opens a write connection on the original file. Reading the
+        giant composer.composerHeaders blob through that connection avoids
+        a second (sometimes copying) handle on a multi-GB DB.
+        """
+        write_conn = getattr(self, "_write_conn", None)
+        if write_conn is not None:
+            return write_conn
+        return self._ensure_read_copy()
 
     def close(self):
         """Close connections and clean up temp files."""
@@ -117,11 +157,11 @@ class CursorDB:
         finally:
             self._in_transaction = False
 
-    # ── Read operations (on temp copy) ──────────────────────────────
+    # ── Read operations ─────────────────────────────────────────────
 
     def get_item(self, key: str, table: str = "ItemTable") -> Optional[str]:
         """Get a value from the key-value store."""
-        conn = self._ensure_read_copy()
+        conn = self._query_conn()
         try:
             row = conn.execute(
                 f"SELECT value FROM {table} WHERE key = ?", (key,)
@@ -137,7 +177,7 @@ class CursorDB:
 
     def get_item_binary(self, key: str, table: str = "ItemTable") -> Optional[bytes]:
         """Get a raw binary value from the key-value store."""
-        conn = self._ensure_read_copy()
+        conn = self._query_conn()
         try:
             row = conn.execute(
                 f"SELECT value FROM {table} WHERE key = ?", (key,)
@@ -157,7 +197,7 @@ class CursorDB:
 
     def list_keys(self, prefix: str = "", table: str = "cursorDiskKV") -> list[str]:
         """List all keys in a table, optionally filtered by prefix."""
-        conn = self._ensure_read_copy()
+        conn = self._query_conn()
         try:
             if prefix:
                 rows = conn.execute(
@@ -179,7 +219,7 @@ class CursorDB:
 
         Uses a single SQL query — efficient even on large databases.
         """
-        conn = self._ensure_read_copy()
+        conn = self._query_conn()
         result: dict[str, int] = {}
         try:
             prefix = key_type + ":"
@@ -209,7 +249,7 @@ class CursorDB:
 
     def get_items_by_prefix(self, prefix: str, table: str = "cursorDiskKV") -> dict[str, str]:
         """Get all key-value pairs matching a prefix as strings."""
-        conn = self._ensure_read_copy()
+        conn = self._query_conn()
         try:
             rows = conn.execute(
                 f"SELECT key, value FROM {table} WHERE key LIKE ?", (prefix + "%",)
@@ -226,7 +266,7 @@ class CursorDB:
 
     def get_json_items_by_prefix(self, prefix: str, table: str = "cursorDiskKV") -> dict[str, Any]:
         """Get all key-value pairs matching a prefix and parse values as JSON."""
-        conn = self._ensure_read_copy()
+        conn = self._query_conn()
         try:
             rows = conn.execute(
                 f"SELECT key, value FROM {table} WHERE key LIKE ?", (prefix + "%",)
@@ -250,7 +290,7 @@ class CursorDB:
         taken from the ``workspaceId`` column (sidebar index key). Returns []
         if the table is absent (older Cursor builds).
         """
-        conn = self._ensure_read_copy()
+        conn = self._query_conn()
         try:
             exists = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='composerHeaders'"
@@ -295,7 +335,7 @@ class CursorDB:
         """Get multiple raw binary values from the key-value store in a single query."""
         if not keys:
             return {}
-        conn = self._ensure_read_copy()
+        conn = self._query_conn()
         result = {}
         try:
             for i in range(0, len(keys), 500):
@@ -329,7 +369,13 @@ class CursorDB:
     def _get_write_conn(self) -> sqlite3.Connection:
         """Get or create a connection for write operations on the ORIGINAL database."""
         if not hasattr(self, "_write_conn") or self._write_conn is None:
-            self._write_conn = sqlite3.connect(str(self.db_path))
+            conn = sqlite3.connect(str(self.db_path), timeout=60)
+            # Per-connection (not persisted). NORMAL is safe with WAL and avoids
+            # an fsync on every commit against a multi-GB global DB.
+            conn.execute("PRAGMA busy_timeout=60000")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            self._write_conn = conn
         return self._write_conn
 
     def write_item(self, key: str, value: str, table: str = "ItemTable"):
@@ -427,6 +473,64 @@ class CursorDB:
 
 
 
+def _file_mb(path: Path) -> float:
+    try:
+        return path.stat().st_size / (1024 * 1024)
+    except OSError:
+        return 0.0
+
+
+def _copy_file_fast(src: Path, dst: Path) -> str:
+    """Copy *src* to *dst*, using a copy-on-write clone when the FS supports it.
+
+    Returns ``"clone"`` or ``"copy"``. CoW clones (APFS clonefile, Linux FICLONE)
+    make backing up a multi-GB Cursor DB effectively instant; a byte copy of
+    that same file is often the multi-minute wait behind a tiny chat import.
+    """
+    import platform
+
+    system = platform.system()
+    if dst.exists():
+        dst.unlink()
+
+    if system == "Darwin":
+        try:
+            import ctypes
+
+            libc = ctypes.CDLL("/usr/lib/libc.dylib", use_errno=True)
+            clonefile = libc.clonefile
+            clonefile.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+            clonefile.restype = ctypes.c_int
+            if clonefile(os.fsencode(src), os.fsencode(dst), 0) == 0:
+                shutil.copystat(src, dst, follow_symlinks=True)
+                return "clone"
+        except Exception:
+            if dst.exists():
+                try:
+                    dst.unlink()
+                except OSError:
+                    pass
+    elif system == "Linux":
+        # FICLONE: _IOW(0x94, 9, int) on 64-bit Linux
+        FICLONE = 0x40049409
+        try:
+            import fcntl
+
+            with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+                fcntl.ioctl(fdst.fileno(), FICLONE, fsrc.fileno())
+            shutil.copystat(src, dst, follow_symlinks=True)
+            return "clone"
+        except OSError:
+            if dst.exists():
+                try:
+                    dst.unlink()
+                except OSError:
+                    pass
+
+    shutil.copy2(src, dst)
+    return "copy"
+
+
 def backup_db(db_path: Path, keep: int = 2) -> Path:
     """Create a timestamped backup of a database file.
 
@@ -434,24 +538,39 @@ def backup_db(db_path: Path, keep: int = 2) -> Path:
     older ones to prevent unbounded disk usage. The global DB can be
     multi-GB, so even a handful of stale backups can fill a disk.
 
+    Uses a copy-on-write clone when the filesystem supports it (APFS,
+    btrfs, XFS reflink) so a multi-GB backup is not a multi-minute copy.
+
     Returns the path to the new backup.
     """
     from datetime import datetime
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     backup_path = db_path.parent / f"{db_path.stem}.backup_{timestamp}{db_path.suffix}"
-    shutil.copy2(db_path, backup_path)
 
+    size_mb = _file_mb(db_path)
+    wal = db_path.parent / (db_path.name + "-wal")
+    wal_mb = _file_mb(wal) if wal.exists() else 0.0
+    extra = f" + {wal_mb:.0f} MB WAL" if wal_mb >= 1 else ""
+    print(f"  Backing up {db_path.name} ({size_mb:.0f} MB{extra})...", flush=True)
+    t0 = time.monotonic()
+
+    method = _copy_file_fast(db_path, backup_path)
     for suffix in ("-wal", "-shm"):
-        wal = db_path.parent / (db_path.name + suffix)
-        if wal.exists():
-            shutil.copy2(wal, db_path.parent / (backup_path.name + suffix))
+        sidecar = db_path.parent / (db_path.name + suffix)
+        if sidecar.exists():
+            _copy_file_fast(sidecar, db_path.parent / (backup_path.name + suffix))
 
-    # Clean up old backups, keeping only the newest `keep`
+    elapsed = time.monotonic() - t0
+    how = "Cloned" if method == "clone" else "Copied"
+    print(f"  {how} in {elapsed:.1f}s → {backup_path.name}", flush=True)
+
+    # Clean up old backups, keeping only the newest `keep`.
+    # Sort by filename (embedded timestamp), not mtime: copy2/clonefile
+    # preserves the source mtime so all backups can share one timestamp.
     pattern = f"{db_path.stem}.backup_*{db_path.suffix}"
     old_backups = sorted(
         db_path.parent.glob(pattern),
-        key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
     for stale in old_backups[keep:]:

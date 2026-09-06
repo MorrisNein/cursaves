@@ -13,6 +13,7 @@ from .watch import watch_loop
 from .backends import GitBackend, S3Backend, SyncBackend, get_backend, load_config, save_config
 from .importer import (
     _local_composer_missing_blobs,
+    backup_cursor_dbs,
     collapse_duplicate_workspaces,
     copy_between_workspaces,
     doctor_audit,
@@ -1541,9 +1542,10 @@ def cmd_pull(args):
                         continue
 
                 _import_agent_config([target_path])
+                backup_cursor_dbs()
                 for sf in selected_files:
                     print(f"  Importing {sf.name}...")
-                    if import_snapshot(sf, target_path):
+                    if import_snapshot(sf, target_path, skip_backup=True):
                         total_success += 1
                         print("    OK")
                     else:
@@ -1551,12 +1553,20 @@ def cmd_pull(args):
                         print("    FAILED")
             else:
                 _import_agent_config([ws["path"] for ws in target_workspaces])
+                backup_cursor_dbs()
+                backed_up_ws: set[str] = set()
                 for ws in target_workspaces:
                     display = paths.format_workspace_display(ws)
                     print(f"  Importing into: {display}")
+                    ws_dir_str = str(ws["workspace_dir"])
+                    if ws_dir_str not in backed_up_ws:
+                        backup_cursor_dbs(
+                            ws["workspace_dir"], include_global=False
+                        )
+                        backed_up_ws.add(ws_dir_str)
                     for sf in selected_files:
                         print(f"    {sf.name}...")
-                        if import_snapshot(sf, ws["path"], target_workspace_dir=ws["workspace_dir"]):
+                        if import_snapshot(sf, ws["path"], target_workspace_dir=ws["workspace_dir"], skip_backup=True):
                             total_success += 1
                         else:
                             total_failure += 1
